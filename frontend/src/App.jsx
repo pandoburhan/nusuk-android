@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { LayoutDashboard, KeyRound, Award, Terminal, RefreshCw } from 'lucide-react';
 import Header from './components/Header';
 import KPICards from './components/KPICards';
@@ -10,6 +10,7 @@ import QuizHistory from './components/QuizHistory';
 import SystemLogs from './components/SystemLogs';
 import SettingsModal from './components/SettingsModal';
 import AddDeviceModal from './components/AddDeviceModal';
+import AutoLoginModal from './components/AutoLoginModal';
 import LockScreen from './components/LockScreen';
 import { Toasts } from './components/common';
 
@@ -24,9 +25,17 @@ export default function App() {
   const [activeMainTab, setActiveMainTab] = useState('dashboard');
   const [statusData, setStatusData] = useState(null);
   const [kpiData, setKpiData] = useState(null);
-  const [previewRefreshSec, setPreviewRefreshSec] = useState(4);
+  const [previewSpeed, setPreviewSpeed] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem('nusuk_preview_speed');
+      return ['off', 'slow', 'normal', 'fast'].includes(saved) ? saved : 'normal';
+    } catch {
+      return 'normal';
+    }
+  });
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isAddDeviceOpen, setIsAddDeviceOpen] = useState(false);
+  const [autoLoginUuid, setAutoLoginUuid] = useState(null);
   const [toasts, setToasts] = useState([]);
   const [refreshTick, setRefreshTick] = useState(0);
   const [timezone, setTimezone] = useState(() => {
@@ -48,6 +57,16 @@ export default function App() {
     }
   }, []);
 
+  const handleChangePreviewSpeed = useCallback((nextSpeed) => {
+    const clean = ['off', 'slow', 'normal', 'fast'].includes(nextSpeed) ? nextSpeed : 'normal';
+    setPreviewSpeed(clean);
+    try {
+      window.localStorage.setItem('nusuk_preview_speed', clean);
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
   const handleUnauthorized = useCallback(() => {
     setAuthToken(null);
     setAuthTokenState(null);
@@ -55,6 +74,7 @@ export default function App() {
     setKpiData(null);
     setIsSettingsOpen(false);
     setIsAddDeviceOpen(false);
+    setAutoLoginUuid(null);
     setLockNotice('Sesi akses tidak valid atau server baru saja dimulai ulang. Silakan masukkan password kembali.');
   }, []);
 
@@ -87,12 +107,9 @@ export default function App() {
   const fetchSettings = useCallback(async () => {
     if (!authToken) return;
     try {
-      const res = await settingsApi.getSettings();
-      if (res.data?.preview_refresh_seconds) {
-        setPreviewRefreshSec(res.data.preview_refresh_seconds);
-      }
+      await settingsApi.getSettings();
     } catch {
-      // keep default 4s
+      // ignore settings fetch error
     }
   }, [authToken]);
 
@@ -140,7 +157,9 @@ export default function App() {
   }, [authToken, telemetry.lastQuizEvent, telemetry.lastKeyEvent, fetchOverallData]);
 
   // Surface backend WebSocket alerts as toasts
-  const { latestAlert, clearAlert } = telemetry;
+  const { latestAlert, clearAlert, lastRedroidEvent, refreshInstances } = telemetry;
+  const lastRedroidSeqRef = useRef(0);
+
   useEffect(() => {
     if (latestAlert) {
       addToast({
@@ -151,11 +170,40 @@ export default function App() {
     }
   }, [latestAlert, addToast, clearAlert]);
 
+  // Surface Redroid provisioning / pull WebSocket events as toasts & auto-refresh instances when ready
+  useEffect(() => {
+    if (!lastRedroidEvent || lastRedroidEvent._seq === lastRedroidSeqRef.current) return;
+    lastRedroidSeqRef.current = lastRedroidEvent._seq;
+    const st = lastRedroidEvent.status;
+    const toastType =
+      st === 'ready' || st === 'success'
+        ? 'success'
+        : st === 'error'
+          ? 'error'
+          : 'info';
+    addToast({
+      type: toastType,
+      title: lastRedroidEvent.title || 'Redroid Provisioning',
+      message: lastRedroidEvent.message || 'Memproses instance Redroid...',
+    });
+    if (st === 'ready' || lastRedroidEvent.stage === 'ready') {
+      refreshInstances();
+      fetchOverallData();
+    }
+  }, [lastRedroidEvent, addToast, refreshInstances, fetchOverallData]);
+
+  const handleOpenAutoLogin = useCallback((inst) => {
+    if (inst?.uuid) setAutoLoginUuid(inst.uuid);
+  }, []);
+
   if (!authToken) {
     return <LockScreen onUnlock={handleUnlock} noticeMessage={lockNotice} />;
   }
 
   const unusedPure = kpiData?.global?.unused_pure;
+  const activeAutoLoginInst = autoLoginUuid
+    ? telemetry.instances.find((i) => i.uuid === autoLoginUuid) || null
+    : null;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
@@ -255,11 +303,13 @@ export default function App() {
               <div className="lg:col-span-2">
                 <EmulatorPreview
                   instances={telemetry.instances}
-                  intervalSec={previewRefreshSec}
+                  previewSpeed={previewSpeed}
+                  onChangePreviewSpeed={handleChangePreviewSpeed}
                   patchInstance={telemetry.patchInstance}
                   toast={addToast}
                   refreshInstances={telemetry.refreshInstances}
                   onAdd={() => setIsAddDeviceOpen(true)}
+                  onOpenAutoLogin={handleOpenAutoLogin}
                 />
               </div>
 
@@ -268,6 +318,7 @@ export default function App() {
                   instances={telemetry.instances}
                   toast={addToast}
                   onAdd={() => setIsAddDeviceOpen(true)}
+                  onOpenAutoLogin={handleOpenAutoLogin}
                   onActionComplete={() => {
                     fetchOverallData();
                     telemetry.refreshInstances();
@@ -316,10 +367,19 @@ export default function App() {
         <AddDeviceModal
           onClose={() => setIsAddDeviceOpen(false)}
           toast={addToast}
+          lastRedroidEvent={telemetry.lastRedroidEvent}
           refreshInstances={() => {
             telemetry.refreshInstances();
             fetchOverallData();
           }}
+        />
+      )}
+
+      {activeAutoLoginInst && (
+        <AutoLoginModal
+          inst={activeAutoLoginInst}
+          onClose={() => setAutoLoginUuid(null)}
+          toast={addToast}
         />
       )}
 

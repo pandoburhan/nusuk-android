@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Play, Square, RotateCcw, Bot, Plus, Power, Smartphone, ArrowRightLeft, AlertTriangle, Sliders, Check } from 'lucide-react';
+import { Play, Square, RotateCcw, Bot, Plus, Power, Smartphone, ArrowRightLeft, AlertTriangle, Sliders, Check, LogIn, KeyRound, Loader2 } from 'lucide-react';
 import { controlApi, errorDetail } from '../api/client';
 import { ONLINE, StatusBadge, ConnectionBadge, ConfirmModal } from './common';
 
@@ -25,7 +25,7 @@ const MODES = [
   },
 ];
 
-export default function CommandCenter({ instances, toast, onAdd, onActionComplete }) {
+export default function CommandCenter({ instances, toast, onAdd, onActionComplete, onOpenAutoLogin }) {
   const [mode, setMode] = useState('auto');
   const [selected, setSelected] = useState(() => new Set());
   const [busy, setBusy] = useState(false);
@@ -442,6 +442,35 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
                   </div>
                   <StatusBadge status={i.status} />
                 </div>
+
+                {/* Inline Auto-Login quick button when device needs credentials/OTP */}
+                {i.login_status === 'AWAITING_CREDENTIALS' && onOpenAutoLogin && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenAutoLogin(i)}
+                    className="mt-2 w-full py-1.5 px-2.5 rounded-lg bg-gradient-to-r from-orange-600 to-rose-600 hover:from-orange-500 hover:to-rose-500 text-white text-[10px] font-bold flex items-center justify-center gap-1.5 shadow shadow-orange-600/20 transition"
+                  >
+                    <LogIn className="w-3 h-3" /> Auto Login Required
+                  </button>
+                )}
+                {i.login_status === 'AWAITING_OTP' && onOpenAutoLogin && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenAutoLogin(i)}
+                    className="mt-2 w-full py-1.5 px-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[10px] font-bold flex items-center justify-center gap-1.5 shadow shadow-amber-500/20 transition"
+                  >
+                    <KeyRound className="w-3 h-3" /> Input OTP Required (4 Digit)
+                  </button>
+                )}
+                {i.login_status === 'PROCESSING_LOGIN' && onOpenAutoLogin && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenAutoLogin(i)}
+                    className="mt-2 w-full py-1 px-2.5 rounded-lg bg-sky-950/60 hover:bg-sky-950 text-sky-300 border border-sky-600/40 text-[10px] font-semibold flex items-center justify-center gap-1.5 transition"
+                  >
+                    <Loader2 className="w-3 h-3 animate-spin" /> Processing Auto-Login…
+                  </button>
+                )}
 
                 {/* Per-Device Stop Condition Control (visible on all cards, highlighted when selected) */}
                 <div className={`mt-2 pt-2 border-t flex flex-wrap items-center justify-between gap-2 text-[10px] ${on ? 'border-slate-700/80' : 'border-slate-800/40 text-slate-400'}`}>

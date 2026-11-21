@@ -1,0 +1,25 @@
+# Web Framework & ASGI Server
+fastapi==0.163.1
+uvicorn==0.54.0
+websockets==17.4
+
+# Security & Authentication
+bcrypt==5.0.0
+
+# Database & MySQL Driver
+SQLAlchemy==2.1.9
+pymysql==1.2.4
+cryptography==49.0.0
+
+# Configuration & Validation
+pydantic==2.14.3
+pydantic-settings==2.16.3
+python-dotenv==1.2.2
+
+# Automation & HTTP/AI Clients
+uiautomator2==3.7.1
+openai==3.52.0
+requests==2.34.2
+
+# Docker SDK (Redroid Orchestration on Linux)
+docker>=7.1.0

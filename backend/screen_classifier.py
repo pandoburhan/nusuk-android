@@ -7,6 +7,12 @@ logger = logging.getLogger(__name__)
 
 class ScreenState:
     SCREEN_LAUNCHER_OR_CLOSED = "SCREEN_LAUNCHER_OR_CLOSED"
+    SCREEN_WELCOME_SLIDES = "SCREEN_WELCOME_SLIDES"
+    SCREEN_LOGIN_MAIN = "SCREEN_LOGIN_MAIN"
+    SCREEN_LOGIN_METHOD_POPUP = "SCREEN_LOGIN_METHOD_POPUP"
+    SCREEN_CREDENTIALS_FORM = "SCREEN_CREDENTIALS_FORM"
+    SCREEN_VERIFY_OTP_FORM = "SCREEN_VERIFY_OTP_FORM"
+    SCREEN_LOGGED_OUT_TIMED_OUT = "SCREEN_LOGGED_OUT_TIMED_OUT"
     SCREEN_LOCATION_POPUP = "SCREEN_LOCATION_POPUP"
     SCREEN_DAILY_LIMIT_POPUP = "SCREEN_DAILY_LIMIT_POPUP"
     SCREEN_NUSUK_HOME = "SCREEN_NUSUK_HOME"
@@ -83,6 +89,9 @@ class ScreenClassifier:
             "state": ScreenState.SCREEN_UNKNOWN_OR_LOADING,
             "current_app_keys": None,
             "screen_size": (screen_w or 720, screen_h or 1280),
+            "welcome_data": None,        # {"next_bounds": tuple}
+            "login_data": None,          # {"login_or_register_bounds", "login_with_email_bounds", "email_edit_bounds", "password_edit_bounds", "remember_me": {...}, "login_btn_bounds", "login_btn_enabled", "error_msg"}
+            "otp_data": None,            # {"otp_inputs": list, "verify_bounds": tuple, "verify_enabled": bool, "error_msg": str}
             "location_popup_data": None, # {"later_bounds": tuple}
             "daily_limit_data": None,    # {"message": str, "close_bounds": tuple}
             "home_data": None,           # {"start_challenge_bounds": tuple}
@@ -113,6 +122,7 @@ class ScreenClassifier:
             logger.error(f"Error parsing XML hierarchy: {e}")
             return info
 
+        parent_map = {child: parent for parent in root.iter() for child in parent}
         all_nodes = []
         xml_packages_set = set()
         max_x2 = 0
@@ -130,11 +140,14 @@ class ScreenClassifier:
                     max_y2 = bounds[3]
             clickable = node.attrib.get("clickable", "false").lower() == "true"
             enabled = node.attrib.get("enabled", "true").lower() == "true"
+            checkable = node.attrib.get("checkable", "false").lower() == "true"
+            checked = node.attrib.get("checked", "false").lower() == "true"
+            password = node.attrib.get("password", "false").lower() == "true"
             res_id = node.attrib.get("resource-id", "")
 
             if pkg:
                 xml_packages_set.add(pkg)
-            
+
             entry = {
                 "text": text,
                 "norm_text": normalize_text(text),
@@ -145,8 +158,12 @@ class ScreenClassifier:
                 "bounds": bounds,
                 "clickable": clickable,
                 "enabled": enabled,
+                "checkable": checkable,
+                "checked": checked,
+                "password": password,
                 "resource_id": res_id,
-                "node": node
+                "node": node,
+                "parent": parent_map.get(node),
             }
             all_nodes.append(entry)
             if text:
@@ -228,6 +245,266 @@ class ScreenClassifier:
                 "message": popup_msg,
                 "close_bounds": close_bounds,
             }
+            return info
+
+        # Helper to find clickable Compose container for a label node (bounds & enabled state)
+        def _clickable_button_info(entry: Dict[str, Any]) -> Tuple[Optional[Tuple[int, int, int, int]], bool]:
+            cur = entry["node"]
+            while cur is not None:
+                if cur.attrib.get("clickable", "false").lower() == "true":
+                    b = parse_bounds(cur.attrib.get("bounds", "")) or entry["bounds"]
+                    en = cur.attrib.get("enabled", "true").lower() == "true"
+                    return b, en
+                cur = parent_map.get(cur)
+            return entry["bounds"], entry["enabled"]
+
+        # 1c. Check for SCREEN_LOGGED_OUT_TIMED_OUT ("Session Timed Out" modal)
+        if "session timed out" in combined_text or (
+            "please log in again to continue" in combined_text and "login with email" in combined_text
+        ):
+            info["state"] = ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT
+            login_email_bounds = None
+            close_bounds = None
+            for n in all_nodes:
+                if not n["bounds"]:
+                    continue
+                if n["norm_text"] == "login with email" or n["norm_desc"] == "login with email":
+                    login_email_bounds, _ = _clickable_button_info(n)
+                elif n["norm_text"] == "close" or n["norm_desc"] == "close":
+                    close_bounds, _ = _clickable_button_info(n)
+            info["login_data"] = {
+                "login_with_email_bounds": login_email_bounds,
+                "close_bounds": close_bounds,
+            }
+            return info
+
+        # 1d. Check for SCREEN_LOGIN_METHOD_POPUP ("Log In to Continue" bottom sheet)
+        if "log in to continue" in combined_text or (
+            "login with email" in combined_text and "login with nafath" in combined_text
+        ):
+            info["state"] = ScreenState.SCREEN_LOGIN_METHOD_POPUP
+            login_email_bounds = None
+            close_bounds = None
+            for n in all_nodes:
+                if not n["bounds"]:
+                    continue
+                if n["norm_text"] == "login with email" or n["norm_desc"] == "login with email":
+                    login_email_bounds, _ = _clickable_button_info(n)
+                elif n["norm_text"] == "close" or n["norm_desc"] == "close":
+                    close_bounds, _ = _clickable_button_info(n)
+            info["login_data"] = {
+                "login_with_email_bounds": login_email_bounds,
+                "close_bounds": close_bounds,
+            }
+            return info
+
+        # 1e. Check for SCREEN_VERIFY_OTP_FORM (4-digit Email Verification Code)
+        if (
+            "enter verification code" in combined_text
+            or "4-digit verification code" in combined_text
+            or ("verify your email" in combined_text and "verification code" in combined_text)
+        ):
+            info["state"] = ScreenState.SCREEN_VERIFY_OTP_FORM
+            otp_inputs: List[Dict[str, Any]] = []
+            verify_bounds = None
+            verify_enabled = True
+            otp_error = ""
+
+            otp_err_patterns = (
+                "unable to verify",
+                "invalid code",
+                "incorrect code",
+                "wrong code",
+                "code expired",
+                "expired",
+                "try again",
+                "failed",
+            )
+            for n in all_nodes:
+                if n["class"] == "android.widget.EditText" and n["bounds"]:
+                    otp_inputs.append({
+                        "bounds": n["bounds"],
+                        "center": bounds_center(n["bounds"]),
+                        "text": n["text"],
+                    })
+                elif n["norm_text"] == "verify your email" and n["bounds"]:
+                    # Distinguishes the bottom CTA button ("Verify Your Email") from top subtitle ("Verify your email")
+                    if n["bounds"][1] > int(sh * 0.45):
+                        verify_bounds, verify_enabled = _clickable_button_info(n)
+                elif n["norm_text"] and any(p in n["norm_text"] for p in otp_err_patterns):
+                    if "request a new code" not in n["norm_text"]:
+                        otp_error = n["text"] or otp_error
+
+            otp_inputs.sort(key=lambda item: item["bounds"][0])
+            info["otp_data"] = {
+                "otp_inputs": otp_inputs,
+                "verify_bounds": verify_bounds,
+                "verify_enabled": verify_enabled,
+                "error_msg": otp_error,
+            }
+            return info
+
+        # 1f. Check for SCREEN_CREDENTIALS_FORM ("Welcome back" / "Login to your account")
+        if (
+            ("login to your account" in combined_text and ("email address" in combined_text or "password" in combined_text))
+            or ("welcome back" in combined_text and "email address" in combined_text and "password" in combined_text)
+            or ("email address" in combined_text and "password" in combined_text and "have an issue in login" in combined_text)
+        ):
+            info["state"] = ScreenState.SCREEN_CREDENTIALS_FORM
+            email_edit_bounds = None
+            email_text = ""
+            password_edit_bounds = None
+            password_text = ""
+            login_btn_bounds = None
+            login_btn_enabled = True
+            cred_error = ""
+            remember_me: Dict[str, Any] = {
+                "found": False,
+                "checked": False,
+                "bounds": None,
+                "source": None,
+            }
+
+            edit_nodes = [n for n in all_nodes if n["class"] == "android.widget.EditText" and n["bounds"]]
+            edit_nodes.sort(key=lambda item: item["bounds"][1])
+            for idx, en in enumerate(edit_nodes):
+                if en["password"]:
+                    password_edit_bounds = en["bounds"]
+                    password_text = en["text"]
+                elif email_edit_bounds is None:
+                    email_edit_bounds = en["bounds"]
+                    email_text = en["text"]
+                elif password_edit_bounds is None and idx == 1:
+                    password_edit_bounds = en["bounds"]
+                    password_text = en["text"]
+
+            cred_err_patterns = (
+                "invalid email or password",
+                "invalid credentials",
+                "incorrect password",
+                "wrong password",
+                "invalid email",
+                "account locked",
+                "too many attempts",
+                "please try again",
+            )
+            for n in all_nodes:
+                if not n["bounds"]:
+                    continue
+                if n["norm_text"] == "login":
+                    login_btn_bounds, login_btn_enabled = _clickable_button_info(n)
+                elif n["norm_text"] and any(p in n["norm_text"] for p in cred_err_patterns):
+                    cred_error = n["text"] or cred_error
+
+                # Strategy A: standard Android checkable toggle/checkbox/switch
+                if n["checkable"] or any(k in n["class"] for k in ("CheckBox", "Switch")):
+                    remember_me = {
+                        "found": True,
+                        "checked": bool(n["checked"]),
+                        "bounds": n["bounds"],
+                        "source": "checkable",
+                    }
+
+            # Strategy B: Nusuk Jetpack Compose custom toggle between Password field & Login button
+            # Observed in 08_credentials_form.xml & 09_credentials_error.xml:
+            # Clickable View with 2 child Views: child[0] = thumb, child[1] = track [46,y1][110,y2].
+            # When OFF, thumb center_x < track center_x; when ON, thumb center_x >= track center_x.
+            if not remember_me["found"] and password_edit_bounds and login_btn_bounds:
+                y_top = password_edit_bounds[3] - 10
+                y_bot = login_btn_bounds[1] + 10
+                for n in all_nodes:
+                    b = n["bounds"]
+                    if not b or not n["clickable"] or n["class"] != "android.view.View":
+                        continue
+                    if b[1] < y_top or b[3] > y_bot:
+                        continue
+                    children = list(n["node"])
+                    if len(children) == 2:
+                        c0_b = parse_bounds(children[0].attrib.get("bounds", ""))
+                        c1_b = parse_bounds(children[1].attrib.get("bounds", ""))
+                        if c0_b and c1_b and c1_b[2] > c1_b[0]:
+                            thumb_cx = (c0_b[0] + c0_b[2]) / 2.0
+                            track_cx = (c1_b[0] + c1_b[2]) / 2.0
+                            remember_me = {
+                                "found": True,
+                                "checked": bool(thumb_cx >= track_cx),
+                                "bounds": c1_b,  # tap directly on the visible switch track
+                                "source": "compose_geometry",
+                            }
+                            break
+
+            info["login_data"] = {
+                "email_edit_bounds": email_edit_bounds,
+                "email_text": email_text,
+                "password_edit_bounds": password_edit_bounds,
+                "password_has_value": bool(password_text),
+                "login_btn_bounds": login_btn_bounds,
+                "login_btn_enabled": login_btn_enabled,
+                "remember_me": remember_me,
+                "error_msg": cred_error,
+            }
+            return info
+
+        # 1g. Check for SCREEN_LOGIN_MAIN ("Are you ready to start your journey?")
+        if (
+            "are you ready to start your journey" in combined_text
+            or ("login or register" in combined_text and "continue as guest" in combined_text)
+        ):
+            info["state"] = ScreenState.SCREEN_LOGIN_MAIN
+            login_reg_bounds = None
+            guest_bounds = None
+            for n in all_nodes:
+                if not n["bounds"]:
+                    continue
+                if n["norm_text"] == "login or register" or n["norm_desc"] == "login or register":
+                    login_reg_bounds, _ = _clickable_button_info(n)
+                elif n["norm_text"] == "continue as guest":
+                    guest_bounds, _ = _clickable_button_info(n)
+            info["login_data"] = {
+                "login_or_register_bounds": login_reg_bounds,
+                "continue_as_guest_bounds": guest_bounds,
+            }
+            return info
+
+        # 1h. Check for SCREEN_WELCOME_SLIDES (Onboarding Slides 1-5 on Fresh Install)
+        welcome_phrases = (
+            "umrah in minutes",
+            "flights, hotels, visa",
+            "enter the prophet",
+            "reserve your moment of prayer in rawdah",
+            "the qur'an, always with you",
+            "read or listen",
+            "it's time to pray",
+            "accurate times with smart reminders",
+            "manage your payments easily through nusuk wallet",
+            "nusuk wallet",
+        )
+        has_switch_lang = "switch language" in combined_text
+        next_arrow_bounds = None
+        if has_switch_lang:
+            for n in all_nodes:
+                b = n["bounds"]
+                if not b or not n["clickable"] or n["class"] != "android.view.View":
+                    continue
+                if b[0] > int(sw * 0.50) and b[1] > int(sh * 0.75):
+                    # Right-arrow container holds a Button and does not hold "Switch Language"
+                    has_btn_child = any(
+                        ch.attrib.get("class") == "android.widget.Button"
+                        for ch in n["node"].iter("node")
+                    )
+                    has_lang_child = any(
+                        "switch language" in normalize_text(ch.attrib.get("content-desc", ""))
+                        for ch in n["node"].iter("node")
+                    )
+                    if has_btn_child and not has_lang_child:
+                        next_arrow_bounds = b
+                        break
+
+        if (has_switch_lang and (next_arrow_bounds is not None or any(p in combined_text for p in welcome_phrases))) or (
+            any(p in combined_text for p in welcome_phrases[:8])
+        ):
+            info["state"] = ScreenState.SCREEN_WELCOME_SLIDES
+            info["welcome_data"] = {"next_bounds": next_arrow_bounds}
             return info
 
         # 2. Check for SCREEN_LOCATION_POPUP ("Enable Location" / "Later")
@@ -439,6 +716,7 @@ class ScreenClassifier:
         if has_home_nav and (
             "100 umrah trips" in combined_text or "blessed zamzam" in combined_text
             or "take part today" in combined_text or "start the challenge" in combined_text
+            or ("home" in bottom_nav_labels and any(k in combined_text for k in ("rawdah", "hajj", "umrah", "wallet", "motawef")))
         ):
             info["state"] = ScreenState.SCREEN_NUSUK_HOME
             start_challenge_bounds = None

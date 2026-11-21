@@ -53,6 +53,15 @@ class InstanceStartRequest(BaseModel):
     stop_limit: Optional[int] = Field(default=100, ge=1)
 
 
+class LoginCredentialsRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=1, max_length=255)
+
+
+class LoginOtpRequest(BaseModel):
+    otp_code: str = Field(..., min_length=4, max_length=8)
+
+
 # ---- Bulk Control ----
 class BulkStartRequest(BaseModel):
     device_uuids: List[str] = Field(default_factory=list)
@@ -103,3 +112,9 @@ class TestAIRequest(BaseModel):
     ai_base_url: Optional[str] = None
     ai_api_key: Optional[str] = None
     ai_model: Optional[str] = None
+
+
+# ---- Redroid (Linux Docker) ----
+class RedroidDeployRequest(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=64)
+    adb_port: Optional[int] = Field(default=None, ge=1024, le=65535)

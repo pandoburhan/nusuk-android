@@ -1,6 +1,36 @@
 import os
+import stat
 from pydantic_settings import BaseSettings
 from pydantic import Field
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_ADB_PATH = "platform-tools/adb.exe" if os.name == "nt" else "platform-tools/adb"
+
+
+def resolve_adb_binary(configured_path: str) -> str:
+    """Resolve ADB binary path cross-platform (Windows .exe vs Linux/macOS binary)."""
+    raw = (configured_path or DEFAULT_ADB_PATH).strip()
+    candidate = raw if os.path.isabs(raw) else os.path.join(PROJECT_ROOT, raw)
+    candidate = os.path.abspath(candidate)
+
+    if os.name == "nt":
+        if not candidate.lower().endswith(".exe") and not os.path.exists(candidate):
+            win_cand = candidate + ".exe"
+            if os.path.exists(win_cand):
+                candidate = win_cand
+    else:
+        if candidate.lower().endswith(".exe") and not os.path.exists(candidate):
+            nix_cand = candidate[:-4]
+            if os.path.exists(nix_cand) or not os.path.exists(candidate):
+                candidate = nix_cand
+        if os.path.exists(candidate) and not os.access(candidate, os.X_OK):
+            try:
+                cur_mode = os.stat(candidate).st_mode
+                os.chmod(candidate, cur_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            except OSError:
+                pass
+    return candidate
+
 
 class Settings(BaseSettings):
     # Database
@@ -11,7 +41,7 @@ class Settings(BaseSettings):
     db_name: str = Field(default="nusuk_key", alias="DB_NAME")
 
     # ADB & Device
-    adb_path: str = Field(default="platform-tools/adb.exe", alias="ADB_PATH")
+    adb_path: str = Field(default=DEFAULT_ADB_PATH, alias="ADB_PATH")
     # RETIRED in v2: only read once by the DB migration to seed the Legacy Primary Instance.
     adb_target: str = Field(default="192.168.100.8:5555", alias="ADB_TARGET")
     nusuk_package: str = Field(default="com.moh.nusukapp", alias="NUSUK_PACKAGE")
@@ -40,7 +70,7 @@ class Settings(BaseSettings):
 
     @property
     def absolute_adb_path(self) -> str:
-        return os.path.abspath(self.adb_path)
+        return resolve_adb_binary(self.adb_path)
 
     class Config:
         env_file = ".env"

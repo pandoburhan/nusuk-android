@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from backend.config import settings
@@ -18,7 +17,7 @@ from backend.telemetry import telemetry_manager
 from backend.time_service import time_service
 from backend.auth import require_auth, verify_access_token
 from backend.routers import (
-    auth, instances, control, keys, analytics, logs, settings as settings_router,
+    auth, instances, control, keys, analytics, logs, settings as settings_router, redroid,
 )
 
 logging.basicConfig(
@@ -138,24 +137,22 @@ app.include_router(keys.router, dependencies=_auth_deps)
 app.include_router(analytics.router, dependencies=_auth_deps)
 app.include_router(logs.router, dependencies=_auth_deps)
 app.include_router(settings_router.router, dependencies=_auth_deps)
+app.include_router(redroid.router, dependencies=_auth_deps)
 
 frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
-assets_dir = os.path.join(frontend_dist, "assets")
-if os.path.exists(assets_dir):
-    app.mount("/assets", StaticFiles(directory=assets_dir), name="static_assets")
-
-
-@app.get("/")
-def root():
-    index_file = os.path.join(frontend_dist, "index.html")
-    if os.path.exists(index_file):
-        return FileResponse(index_file)
-    return {
-        "system": "Nusuk Quiz & Key Automation Hub",
-        "version": "2.0.0",
-        "status": "online",
-        "docs_url": "/docs",
-    }
+if os.path.isdir(frontend_dist) and os.path.isfile(os.path.join(frontend_dist, "index.html")):
+    logger.info(f"Serving built React frontend natively from: {frontend_dist}")
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend_spa")
+else:
+    @app.get("/")
+    def root():
+        return {
+            "system": "Nusuk Quiz & Key Automation Hub",
+            "version": "2.0.0",
+            "status": "online",
+            "docs_url": "/docs",
+            "frontend_built": False,
+        }
 
 
 if __name__ == "__main__":

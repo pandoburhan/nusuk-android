@@ -76,6 +76,10 @@ export const instancesApi = {
   forceRestartApp: (uuid) => api.post(`/instances/${uuid}/force-restart-app`),
   forceRestartDevice: (uuid) => api.post(`/instances/${uuid}/force-restart-device`),
   reconnect: (uuid) => api.post(`/instances/${uuid}/reconnect`),
+  submitLoginCredentials: (uuid, email, password) =>
+    api.post(`/instances/${uuid}/login-credentials`, { email, password }),
+  submitLoginOtp: (uuid, otp_code) =>
+    api.post(`/instances/${uuid}/login-otp`, { otp_code }),
   // Returns a blob. Throws axios error: 409 {detail:'preview_disabled'}, 503 offline.
   screenshot: (uuid, signal) =>
     api.get(`/instances/${uuid}/screenshot`, {
@@ -147,5 +151,14 @@ export const settingsApi = {
   updateSettings: (payload) => api.post('/settings', payload),
   testAI: (payload) => api.post('/settings/test-ai', payload),
 };
+
+export const redroidApi = {
+  getStatus: () => api.get('/redroid/status'),
+  installImage: () => api.post('/redroid/install-image'),
+  deployInstance: (payload = {}) => api.post('/redroid/deploy', payload),
+  destroyInstance: (containerId) => api.delete(`/redroid/destroy/${encodeURIComponent(containerId)}`),
+};
+
+export const redroid = redroidApi;
 
 export default api;

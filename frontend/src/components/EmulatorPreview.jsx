@@ -1,22 +1,43 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Smartphone, Settings as Gear, Eye, EyeOff, RefreshCw, Power, Plug, Pencil, Trash2,
-  WifiOff, Loader2, RotateCcw, Plus, X, Maximize2,
+  WifiOff, Loader2, RotateCcw, Plus, X, Maximize2, Gauge, LogIn, KeyRound,
 } from 'lucide-react';
 import { instancesApi, errorDetail } from '../api/client';
 import { ONLINE, StatusBadge, ConnectionBadge, statusDot, fmtUptime, ConfirmModal } from './common';
 
 const MODE_SHORT = { answer_only: 'Answer', redeem_only: 'Redeem', auto: 'Auto' };
 
-function PreviewArea({ inst, intervalSec, patchInstance, onEnable, onExpand }) {
+export const PREVIEW_SPEED_OPTIONS = [
+  { id: 'off', label: 'Off', intervalMs: 0 },
+  { id: 'slow', label: 'Slow (10s)', intervalMs: 10000 },
+  { id: 'normal', label: 'Normal (4s)', intervalMs: 4000 },
+  { id: 'fast', label: 'Fast (0.5s)', intervalMs: 500 },
+];
+
+export const getPreviewIntervalMs = (speed) => {
+  const found = PREVIEW_SPEED_OPTIONS.find((o) => o.id === speed);
+  return found ? found.intervalMs : 4000;
+};
+
+function PreviewArea({ inst, previewSpeed, intervalMs, patchInstance, onEnable, onExpand }) {
   const online = ONLINE.includes(inst.status);
-  const enabled = online && inst.live_preview_enabled;
+  const globalOff = previewSpeed === 'off' || !intervalMs || intervalMs <= 0;
+  const enabled = !globalOff && online && inst.live_preview_enabled;
   const [src, setSrc] = useState('');
   const [error, setError] = useState(null);
   const urlRef = useRef('');
 
   useEffect(() => {
-    if (!enabled) return undefined;
+    if (!enabled) {
+      if (globalOff && urlRef.current) {
+        URL.revokeObjectURL(urlRef.current);
+        urlRef.current = '';
+        setSrc('');
+        setError(null);
+      }
+      return undefined;
+    }
     let cancelled = false;
     let timer = null;
     const controller = new AbortController();
@@ -40,7 +61,7 @@ function PreviewArea({ inst, intervalSec, patchInstance, onEnable, onExpand }) {
         }
         setError(status === 503 ? 'unavailable' : 'failed');
       }
-      if (!cancelled) timer = setTimeout(tick, Math.max(1, intervalSec) * 1000);
+      if (!cancelled) timer = setTimeout(tick, Math.max(250, intervalMs));
     };
     tick();
 
@@ -49,7 +70,7 @@ function PreviewArea({ inst, intervalSec, patchInstance, onEnable, onExpand }) {
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [enabled, inst.uuid, intervalSec, patchInstance]);
+  }, [enabled, globalOff, inst.uuid, intervalMs, patchInstance]);
 
   useEffect(
     () => () => {
@@ -59,7 +80,15 @@ function PreviewArea({ inst, intervalSec, patchInstance, onEnable, onExpand }) {
   );
 
   let overlay = null;
-  if (inst.status === 'REBOOTING') {
+  if (globalOff) {
+    overlay = (
+      <div className="flex flex-col items-center gap-1.5 text-center px-3 text-slate-400">
+        <EyeOff className="w-6 h-6 text-slate-500" />
+        <span className="text-[11px] font-semibold text-slate-300">Live Preview is Disabled</span>
+        <span className="text-[10px] text-slate-500">Ubah Live Preview Speed untuk mengaktifkan</span>
+      </div>
+    );
+  } else if (inst.status === 'REBOOTING') {
     overlay = (
       <div className="flex flex-col items-center gap-1.5 text-amber-400">
         <Loader2 className="w-6 h-6 animate-spin" />
@@ -100,7 +129,11 @@ function PreviewArea({ inst, intervalSec, patchInstance, onEnable, onExpand }) {
   }
 
   return (
-    <div className="relative h-60 bg-slate-950/80 rounded-lg border border-slate-800/80 flex items-center justify-center overflow-hidden group">
+    <div
+      className={`relative h-60 rounded-lg border border-slate-800/80 flex items-center justify-center overflow-hidden group ${
+        globalOff ? 'bg-slate-800/70' : 'bg-slate-950/80'
+      }`}
+    >
       {enabled && src && !error && (
         <img
           src={src}
@@ -129,9 +162,10 @@ function PreviewArea({ inst, intervalSec, patchInstance, onEnable, onExpand }) {
   );
 }
 
-function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toast }) {
+function FullscreenPreviewModal({ inst, previewSpeed, onChangePreviewSpeed, intervalMs, patchInstance, onClose, toast, onOpenAutoLogin }) {
   const online = ONLINE.includes(inst.status);
-  const enabled = online && inst.live_preview_enabled;
+  const globalOff = previewSpeed === 'off' || !intervalMs || intervalMs <= 0;
+  const enabled = !globalOff && online && inst.live_preview_enabled;
   const [src, setSrc] = useState('');
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -167,7 +201,15 @@ function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toa
   };
 
   useEffect(() => {
-    if (!enabled) return undefined;
+    if (!enabled) {
+      if (globalOff && urlRef.current) {
+        URL.revokeObjectURL(urlRef.current);
+        urlRef.current = '';
+        setSrc('');
+        setError(null);
+      }
+      return undefined;
+    }
     let cancelled = false;
     let timer = null;
     const controller = new AbortController();
@@ -175,7 +217,7 @@ function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toa
     const tick = async () => {
       await fetchScreenshot(controller.signal);
       if (!cancelled) {
-        timer = setTimeout(tick, Math.max(1, intervalSec || 4) * 1000);
+        timer = setTimeout(tick, Math.max(250, intervalMs));
       }
     };
     tick();
@@ -185,7 +227,7 @@ function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toa
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [enabled, inst.uuid, intervalSec, patchInstance]);
+  }, [enabled, globalOff, inst.uuid, intervalMs, patchInstance]);
 
   useEffect(
     () => () => {
@@ -256,6 +298,30 @@ function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toa
 
         {/* Progress & Quick Controls */}
         <div className="flex items-center gap-2.5 ml-auto">
+          {inst.login_status === 'AWAITING_CREDENTIALS' && onOpenAutoLogin && (
+            <button
+              onClick={() => onOpenAutoLogin(inst)}
+              className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-orange-600 to-rose-600 hover:from-orange-500 hover:to-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-orange-600/30 animate-pulse transition"
+            >
+              <LogIn className="w-3.5 h-3.5" /> Auto Login Required
+            </button>
+          )}
+          {inst.login_status === 'AWAITING_OTP' && onOpenAutoLogin && (
+            <button
+              onClick={() => onOpenAutoLogin(inst)}
+              className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-amber-500/30 animate-pulse transition"
+            >
+              <KeyRound className="w-3.5 h-3.5" /> Enter OTP (4 Digit)
+            </button>
+          )}
+          {inst.login_status === 'PROCESSING_LOGIN' && onOpenAutoLogin && (
+            <button
+              onClick={() => onOpenAutoLogin(inst)}
+              className="px-3 py-1.5 rounded-xl bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/40 text-xs font-medium flex items-center gap-1.5 transition"
+            >
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Processing Login…
+            </button>
+          )}
           {ONLINE.includes(inst.status) && (
             <div className="hidden sm:flex flex-col text-right pr-2 border-r border-slate-800">
               <span className="text-[11px] text-slate-300 font-medium font-mono">
@@ -265,6 +331,24 @@ function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toa
                 {inst.current_step || '—'}
               </span>
             </div>
+          )}
+
+          {onChangePreviewSpeed && (
+            <label className="hidden sm:flex items-center gap-1.5 text-[11px] text-slate-400 bg-slate-800/80 border border-slate-700 rounded-xl px-2.5 py-1">
+              <Gauge className="w-3.5 h-3.5 text-sky-400" />
+              <select
+                value={previewSpeed}
+                onChange={(e) => onChangePreviewSpeed(e.target.value)}
+                className="bg-transparent text-slate-200 text-xs font-medium focus:outline-none cursor-pointer"
+                aria-label="Live Preview Speed"
+              >
+                {PREVIEW_SPEED_OPTIONS.map((opt) => (
+                  <option key={opt.id} value={opt.id} className="bg-slate-900 text-slate-100">
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           )}
 
           <button
@@ -317,8 +401,16 @@ function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toa
             />
           </div>
         ) : (
-          <div className="h-full max-h-[65vh] w-full max-w-md bg-slate-900/90 border border-slate-800 rounded-2xl flex flex-col items-center justify-center p-8 text-center shadow-2xl">
-            {!online ? (
+          <div className={`h-full max-h-[65vh] w-full max-w-md border border-slate-800 rounded-2xl flex flex-col items-center justify-center p-8 text-center shadow-2xl ${globalOff ? 'bg-slate-800/90' : 'bg-slate-900/90'}`}>
+            {globalOff ? (
+              <div className="flex flex-col items-center gap-3 text-slate-400">
+                <EyeOff className="w-12 h-12 text-slate-500" />
+                <span className="text-sm font-semibold text-slate-200">Live Preview is Disabled</span>
+                <p className="text-xs text-slate-400 max-w-xs">
+                  Live Preview Speed sedang diatur ke <strong>Off</strong>. Pilih kecepatan polling (Slow / Normal / Fast) untuk mulai menampilkan layar.
+                </p>
+              </div>
+            ) : !online ? (
               <div className="flex flex-col items-center gap-3 text-slate-500">
                 <WifiOff className="w-12 h-12 text-slate-600" />
                 <span className="text-sm font-semibold text-slate-400">Device Offline</span>
@@ -374,7 +466,7 @@ function FullscreenPreviewModal({ inst, intervalSec, patchInstance, onClose, toa
   );
 }
 
-function DeviceCard({ inst, intervalSec, patchInstance, toast, onEdit, refreshInstances, onExpand }) {
+function DeviceCard({ inst, previewSpeed, intervalMs, patchInstance, toast, onEdit, refreshInstances, onExpand, onOpenAutoLogin }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirm, setConfirm] = useState(null); // 'device' | 'delete'
   const online = ONLINE.includes(inst.status);
@@ -503,11 +595,45 @@ function DeviceCard({ inst, intervalSec, patchInstance, toast, onEdit, refreshIn
 
       <PreviewArea
         inst={inst}
-        intervalSec={intervalSec}
+        previewSpeed={previewSpeed}
+        intervalMs={intervalMs}
         patchInstance={patchInstance}
         onEnable={() => togglePreview(true)}
         onExpand={() => onExpand(inst)}
       />
+
+      {/* Auto-Login Action Banner (driven by real-time login_status telemetry) */}
+      {inst.login_status === 'AWAITING_CREDENTIALS' && onOpenAutoLogin && (
+        <button
+          type="button"
+          onClick={() => onOpenAutoLogin(inst)}
+          className="w-full py-2 px-3 rounded-xl bg-gradient-to-r from-orange-600 to-rose-600 hover:from-orange-500 hover:to-rose-500 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-orange-600/25 transition active:scale-[0.99]"
+        >
+          <span className="w-2 h-2 rounded-full bg-white animate-ping" />
+          <LogIn className="w-3.5 h-3.5 shrink-0" />
+          <span>Auto Login Required</span>
+        </button>
+      )}
+      {inst.login_status === 'AWAITING_OTP' && onOpenAutoLogin && (
+        <button
+          type="button"
+          onClick={() => onOpenAutoLogin(inst)}
+          className="w-full py-2 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-amber-500/25 transition active:scale-[0.99]"
+        >
+          <KeyRound className="w-3.5 h-3.5 shrink-0" />
+          <span>Input OTP Required (4 Digit)</span>
+        </button>
+      )}
+      {inst.login_status === 'PROCESSING_LOGIN' && onOpenAutoLogin && (
+        <button
+          type="button"
+          onClick={() => onOpenAutoLogin(inst)}
+          className="w-full py-1.5 px-3 rounded-xl bg-sky-950/60 hover:bg-sky-950 text-sky-300 border border-sky-500/40 text-[11px] font-semibold flex items-center justify-center gap-2 transition"
+        >
+          <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+          <span>Processing Auto-Login…</span>
+        </button>
+      )}
 
       {/* Footer */}
       <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px] text-slate-500">
@@ -657,27 +783,57 @@ function EditDeviceModal({ inst, onClose, toast, refreshInstances }) {
   );
 }
 
-export default function EmulatorPreview({ instances, intervalSec, patchInstance, toast, refreshInstances, onAdd }) {
+export default function EmulatorPreview({
+  instances,
+  previewSpeed = 'normal',
+  onChangePreviewSpeed,
+  patchInstance,
+  toast,
+  refreshInstances,
+  onAdd,
+  onOpenAutoLogin,
+}) {
   const [editing, setEditing] = useState(null);
   const [expandedUuid, setExpandedUuid] = useState(null);
 
   const activeExpanded = expandedUuid ? instances.find((i) => i.uuid === expandedUuid) : null;
+  const intervalMs = getPreviewIntervalMs(previewSpeed);
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-sm flex flex-col">
-      <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3 mb-3">
         <div className="flex items-center gap-2">
           <Smartphone className="w-4 h-4 text-sky-400" />
           <h3 className="text-xs font-semibold text-white">Live Emulator Preview</h3>
           <span className="text-[10px] text-slate-500">({instances.length} instance)</span>
         </div>
-        <button
-          onClick={refreshInstances}
-          className="p-1.5 text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700"
-          title="Muat ulang daftar device"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-        </button>
+
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-[11px]">
+            <Gauge className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+            <span className="text-slate-400 hidden sm:inline">Live Preview Speed:</span>
+            <select
+              value={previewSpeed}
+              onChange={(e) => onChangePreviewSpeed?.(e.target.value)}
+              aria-label="Live Preview Speed"
+              className="bg-slate-950 text-slate-100 font-medium text-[11px] focus:outline-none cursor-pointer pr-1"
+            >
+              {PREVIEW_SPEED_OPTIONS.map((opt) => (
+                <option key={opt.id} value={opt.id} className="bg-slate-900 text-slate-100">
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <button
+            onClick={refreshInstances}
+            className="p-1.5 text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700"
+            title="Muat ulang daftar device"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {instances.length === 0 ? (
@@ -697,12 +853,14 @@ export default function EmulatorPreview({ instances, intervalSec, patchInstance,
             <DeviceCard
               key={inst.uuid}
               inst={inst}
-              intervalSec={intervalSec}
+              previewSpeed={previewSpeed}
+              intervalMs={intervalMs}
               patchInstance={patchInstance}
               toast={toast}
               onEdit={setEditing}
               refreshInstances={refreshInstances}
               onExpand={(d) => setExpandedUuid(d.uuid)}
+              onOpenAutoLogin={onOpenAutoLogin}
             />
           ))}
         </div>
@@ -720,10 +878,13 @@ export default function EmulatorPreview({ instances, intervalSec, patchInstance,
       {activeExpanded && (
         <FullscreenPreviewModal
           inst={activeExpanded}
-          intervalSec={intervalSec}
+          previewSpeed={previewSpeed}
+          onChangePreviewSpeed={onChangePreviewSpeed}
+          intervalMs={intervalMs}
           patchInstance={patchInstance}
           onClose={() => setExpandedUuid(null)}
           toast={toast}
+          onOpenAutoLogin={onOpenAutoLogin}
         />
       )}
     </div>

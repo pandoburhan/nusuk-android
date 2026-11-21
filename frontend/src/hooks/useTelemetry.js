@@ -4,6 +4,7 @@ import { instancesApi } from '../api/client';
 export const ONLINE_STATUSES = ['IDLE', 'RUNNING', 'RECOVERING', 'STOPPING'];
 
 let alertSeq = 0;
+let redroidSeq = 0;
 
 /**
  * Multi-device telemetry. Everything is keyed by device_uuid.
@@ -17,6 +18,7 @@ export function useTelemetry(authToken, onUnauthorized) {
   const [latestAlert, setLatestAlert] = useState(null);
   const [lastQuizEvent, setLastQuizEvent] = useState(null);
   const [lastKeyEvent, setLastKeyEvent] = useState(null);
+  const [lastRedroidEvent, setLastRedroidEvent] = useState(null);
 
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
@@ -87,6 +89,14 @@ export function useTelemetry(authToken, onUnauthorized) {
             setLastKeyEvent({ ...data, _t: Date.now() });
             break;
 
+          case 'redroid_provisioning_event':
+            redroidSeq += 1;
+            setLastRedroidEvent({ ...data, _seq: redroidSeq });
+            if (data.status === 'ready' || data.stage === 'ready') {
+              refreshInstances();
+            }
+            break;
+
           default:
             break;
         }
@@ -109,7 +119,7 @@ export function useTelemetry(authToken, onUnauthorized) {
     ws.onerror = () => {
       ws.close();
     };
-  }, [authToken, patchInstance, onUnauthorized]);
+  }, [authToken, patchInstance, refreshInstances, onUnauthorized]);
 
   useEffect(() => {
     if (!authToken) {
@@ -135,6 +145,7 @@ export function useTelemetry(authToken, onUnauthorized) {
   }, [authToken, connect, refreshInstances]);
 
   const clearAlert = useCallback(() => setLatestAlert(null), []);
+  const clearRedroidEvent = useCallback(() => setLastRedroidEvent(null), []);
 
   return {
     isConnected,
@@ -146,5 +157,7 @@ export function useTelemetry(authToken, onUnauthorized) {
     clearAlert,
     lastQuizEvent,
     lastKeyEvent,
+    lastRedroidEvent,
+    clearRedroidEvent,
   };
 }

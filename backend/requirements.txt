@@ -20,3 +20,6 @@ python-dotenv==1.2.2
 uiautomator2==3.7.1
 openai==3.52.0
 requests==2.34.2
+
+# Docker SDK (Redroid Orchestration on Linux)
+docker>=7.1.0

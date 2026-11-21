@@ -24,11 +24,30 @@ from backend.screen_classifier import (
 )
 from backend.telemetry import telemetry_manager
 from backend.event_log import log_event
-from backend.instance_manager import instance_manager
+from backend.instance_manager import instance_manager, LoginStatus
 from backend.time_service import utc_now_naive
 from backend import key_service
 
 logger = logging.getLogger(__name__)
+
+LOGIN_FLOW_STATES = {
+    ScreenState.SCREEN_WELCOME_SLIDES,
+    ScreenState.SCREEN_LOGIN_MAIN,
+    ScreenState.SCREEN_LOGIN_METHOD_POPUP,
+    ScreenState.SCREEN_CREDENTIALS_FORM,
+    ScreenState.SCREEN_VERIFY_OTP_FORM,
+    ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT,
+}
+
+AUTHENTICATED_STATES = {
+    ScreenState.SCREEN_NUSUK_HOME,
+    ScreenState.SCREEN_CHOOSE_DOOR,
+    ScreenState.SCREEN_DOOR_CONFIRM_POPUP,
+    ScreenState.SCREEN_QUIZ_QUESTION,
+    ScreenState.SCREEN_QUIZ_RESULT,
+    ScreenState.SCREEN_REDEEM_KEYS,
+    ScreenState.SCREEN_REDEEM_SUCCESS,
+}
 
 
 class DeviceOffline(Exception):
@@ -82,6 +101,7 @@ class InstanceWorker:
         self._cycle_timings: Dict[str, int] = {}
         self._last_online_check_at: float = 0.0
         self._custom_stop_step: Optional[str] = None
+        self._login_alert_sent_state: Optional[str] = None
 
     # ------------------------------------------------------------------ properties
     @property
@@ -152,6 +172,25 @@ class InstanceWorker:
             stop_limit=self.stop_limit,
             session_completed_count=self.session_completed_count,
         )
+
+    def _set_login_state(
+        self,
+        login_status: str,
+        step: Optional[str] = None,
+        error: Optional[str] = None,
+        clear_error: bool = False,
+    ):
+        kw: Dict[str, Any] = {
+            "login_status": login_status,
+            "current_screen": str(getattr(self.current_screen, "value", self.current_screen)),
+        }
+        if step is not None:
+            kw["current_step"] = step
+        if clear_error:
+            kw["login_error"] = None
+        elif error is not None:
+            kw["login_error"] = error
+        instance_manager.set_runtime(self.uuid, **kw)
 
     def _alert(self, type_: str, message: str):
         telemetry_manager.emit_sync("alert_event", {"device_uuid": self.uuid, "type": type_, "message": f"[{self.name}] {message}"})
@@ -252,6 +291,9 @@ class InstanceWorker:
             self._cycle_start_time = None
             self._cycle_timings = {}
             self._custom_stop_step = None
+            self._login_alert_sent_state = None
+            instance_manager.clear_login_inputs(self.uuid)
+            instance_manager.set_runtime(self.uuid, emit=False, login_error=None)
             self.log_system(LogSeverity.INFO, "BOT_CONTROL",
                             f"Starting bot in mode '{mode}' on target {self.device_id} (Stop condition: {self.stop_mode}, target={self.stop_limit})")
             self.update_telemetry_status(f"Starting bot in mode '{mode}'...", bot_status="RUNNING")
@@ -295,6 +337,7 @@ class InstanceWorker:
             self._for_switch = for_switch
             self._stop_requested = True
             self._stop_event.set()
+            instance_manager.clear_login_inputs(self.uuid)
             if not for_switch:
                 self.log_system(LogSeverity.INFO, "BOT_CONTROL", f"Stopping bot: {reason}")
                 self.update_telemetry_status(f"Stopping bot: {reason}...", bot_status="STOPPING")
@@ -457,7 +500,11 @@ class InstanceWorker:
                 return None
             info = self._inspect_screen(max_retries=0)
             st = info["state"]
-            if st in (ScreenState.SCREEN_LAUNCHER_OR_CLOSED, ScreenState.SCREEN_DAILY_LIMIT_POPUP):
+            if st in (
+                ScreenState.SCREEN_LAUNCHER_OR_CLOSED,
+                ScreenState.SCREEN_DAILY_LIMIT_POPUP,
+                ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT,
+            ):
                 return info
             if st in target_states and (accept_fn is None or accept_fn(info)):
                 return info
@@ -549,7 +596,7 @@ class InstanceWorker:
             if info["state"] == ScreenState.SCREEN_LOCATION_POPUP:
                 self._handle_screen_location_popup(info)
                 continue
-            if info["state"] in [ScreenState.SCREEN_NUSUK_HOME, ScreenState.SCREEN_CHOOSE_DOOR]:
+            if info["state"] in [ScreenState.SCREEN_NUSUK_HOME, ScreenState.SCREEN_CHOOSE_DOOR] or info["state"] in LOGIN_FLOW_STATES:
                 self.log_system(LogSeverity.INFO, "APP_RECOVERY", f"Successfully recovered to state: {info['state']}")
                 self.consecutive_unknown_count = 0
                 self._prefetched_info = info
@@ -1355,6 +1402,491 @@ class InstanceWorker:
             if nxt:
                 self._prefetched_info = nxt
 
+    # ------------------------------------------------------------------ AUTO-LOGIN HANDLERS
+    def _handle_screen_welcome_slides(self, info: Dict[str, Any]):
+        """Auto-advance Nusuk onboarding Welcome Slides (Slides 1..5 -> Login Main)."""
+        self._set_login_state(
+            LoginStatus.LOGGED_OUT,
+            step="Melewati Welcome Screen (Auto-Login)...",
+            clear_error=True,
+        )
+        welcome_data = info.get("welcome_data") or {}
+        self._click_bounds(welcome_data.get("next_bounds"), fallback_xy=(612, 1169))
+        # Give Compose pager a short moment to slide to the next page or SCREEN_LOGIN_MAIN
+        if not self._sleep(0.35):
+            return
+        nxt = self._inspect_screen(max_retries=0)
+        if nxt["state"] != ScreenState.SCREEN_UNKNOWN_OR_LOADING:
+            self._prefetched_info = nxt
+
+    def _wait_for_login_event(self, event: threading.Event, expected_states: set, poll_step: float = 0.35) -> str:
+        """
+        Interruptible wait loop while waiting for operator credentials or OTP via FastAPI.
+        Returns: 'received' | 'screen_changed' | 'stopped'.
+        """
+        last_screen_check = time.monotonic()
+        while not self._stop_requested:
+            if event.is_set():
+                return "received"
+            if self._stop_event.wait(timeout=poll_step):
+                return "stopped"
+            if event.is_set():
+                return "received"
+
+            # Periodically re-check ADB online & screen in case operator acted manually on emulator
+            now = time.monotonic()
+            if now - last_screen_check >= 3.5:
+                last_screen_check = now
+                fresh = self._inspect_screen(max_retries=0)
+                st = fresh["state"]
+                if st == ScreenState.SCREEN_UNKNOWN_OR_LOADING and not self.d:
+                    self._check_still_online(force=True)
+                elif st != ScreenState.SCREEN_UNKNOWN_OR_LOADING and st not in expected_states:
+                    self._prefetched_info = fresh
+                    return "screen_changed"
+        return "stopped"
+
+    def _ensure_remember_me_off(self, info: Dict[str, Any]) -> Dict[str, Any]:
+        """Verify 'Remember me' toggle state from XML and disable it if ON."""
+        for attempt in range(2):
+            login_data = info.get("login_data") or {}
+            rem = login_data.get("remember_me") or {}
+            if not rem.get("found"):
+                logger.debug(f"Worker [{self.name}] Remember me toggle node not detected in XML")
+                return info
+            if not rem.get("checked"):
+                self.log_system(
+                    LogSeverity.INFO,
+                    "AUTO_LOGIN",
+                    f"Toggle 'Remember me' terverifikasi OFF ({rem.get('source', 'xml')}).",
+                )
+                return info
+
+            self.log_system(
+                LogSeverity.INFO,
+                "AUTO_LOGIN",
+                f"Toggle 'Remember me' terdeteksi ON — mematikan secara otomatis (percobaan #{attempt + 1})...",
+            )
+            self._set_login_state(LoginStatus.PROCESSING_LOGIN, step="Mematikan toggle 'Remember me'...")
+            self._click_bounds(rem.get("bounds"), fallback_xy=(78, 796))
+            if not self._sleep(0.25):
+                return info
+            info = self._inspect_screen(max_retries=0)
+        return info
+
+    def _set_edit_text_safe(self, instance_idx: int, value: str, bounds: Optional[tuple], mask_in_logs: bool = False) -> bool:
+        """Set text into a Jetpack Compose EditText via uiautomator2 .set_text() with focus fallback."""
+        if not self.d:
+            return False
+        display_val = "****" if mask_in_logs else value
+        try:
+            el = self.d(className="android.widget.EditText", instance=instance_idx)
+            if el.exists:
+                el.set_text(value, timeout=3.0)
+                return True
+        except Exception as e:
+            logger.debug(f"Worker [{self.name}] Direct set_text(instance={instance_idx}, val={display_val}) failed: {e}")
+
+        # Fallback: tap field bounds first, then clear & set_text
+        try:
+            if bounds:
+                self._click_bounds(bounds)
+                if not self._sleep(0.15):
+                    return False
+            el = self.d(className="android.widget.EditText", instance=instance_idx)
+            if el.exists:
+                try:
+                    el.clear_text(timeout=2.0)
+                except Exception:
+                    pass
+                el.set_text(value, timeout=3.0)
+                return True
+        except Exception as e:
+            logger.warning(f"Worker [{self.name}] Fallback set_text(instance={instance_idx}, val={display_val}) failed: {e}")
+        return False
+
+    def _fill_credentials_and_submit(self, info: Dict[str, Any], email: str, password: str):
+        """Navigate to credentials form (if needed), type email & password, ensure Remember me OFF, click Login."""
+        # SECURITY: NEVER log `password` anywhere!
+        self._set_login_state(
+            LoginStatus.PROCESSING_LOGIN,
+            step=f"Memulai Auto-Login untuk {email}...",
+            clear_error=True,
+        )
+        self.log_system(LogSeverity.INFO, "AUTO_LOGIN", f"Memproses Auto-Login untuk email '{email}' (password: ****)")
+
+        state = info["state"]
+
+        # Step 1: From SCREEN_LOGIN_MAIN -> click "Login Or Register"
+        if state == ScreenState.SCREEN_LOGIN_MAIN:
+            self._set_login_state(LoginStatus.PROCESSING_LOGIN, step="Menekan 'Login Or Register'...")
+            ld = info.get("login_data") or {}
+            self._click_bounds(ld.get("login_or_register_bounds"), fallback_xy=(360, 1107))
+            nxt = self._wait_for_states(
+                {ScreenState.SCREEN_LOGIN_METHOD_POPUP, ScreenState.SCREEN_CREDENTIALS_FORM},
+                timeout=6.0,
+                poll_interval=0.15,
+                initial_delay=0.15,
+            )
+            if self._stop_requested:
+                return
+            if nxt:
+                info = nxt
+                state = info["state"]
+            else:
+                info = self._inspect_screen(max_retries=1)
+                state = info["state"]
+
+        # Step 2: From SCREEN_LOGIN_METHOD_POPUP or SCREEN_LOGGED_OUT_TIMED_OUT -> click "Login with Email"
+        if state in (ScreenState.SCREEN_LOGIN_METHOD_POPUP, ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT):
+            self._set_login_state(LoginStatus.PROCESSING_LOGIN, step="Memilih metode 'Login with Email'...")
+            ld = info.get("login_data") or {}
+            self._click_bounds(ld.get("login_with_email_bounds"), fallback_xy=(195, 753))
+            nxt = self._wait_for_states(
+                {ScreenState.SCREEN_CREDENTIALS_FORM},
+                timeout=7.0,
+                poll_interval=0.15,
+                initial_delay=0.15,
+            )
+            if self._stop_requested:
+                return
+            if nxt:
+                info = nxt
+                state = info["state"]
+            else:
+                info = self._inspect_screen(max_retries=1)
+                state = info["state"]
+
+        if state != ScreenState.SCREEN_CREDENTIALS_FORM:
+            err_msg = f"Gagal membuka form Email & Password (layar saat ini: {state}). Silakan coba lagi."
+            self.log_system(LogSeverity.WARNING, "AUTO_LOGIN", err_msg)
+            self._set_login_state(LoginStatus.AWAITING_CREDENTIALS, step=err_msg, error=err_msg)
+            self._prefetched_info = info
+            return
+
+        # Step 3: Fill Email & Password on SCREEN_CREDENTIALS_FORM
+        ld = info.get("login_data") or {}
+        pre_submit_err = ld.get("error_msg") or ""
+
+        self._set_login_state(LoginStatus.PROCESSING_LOGIN, step="Mengisi Email Address...")
+        if not self._set_edit_text_safe(0, email, ld.get("email_edit_bounds"), mask_in_logs=False):
+            err_msg = "Gagal mengisi kolom Email Address di aplikasi Nusuk."
+            self.log_system(LogSeverity.ERROR, "AUTO_LOGIN", err_msg)
+            self._set_login_state(LoginStatus.AWAITING_CREDENTIALS, step=err_msg, error=err_msg)
+            return
+
+        if not self._sleep(0.15):
+            return
+
+        self._set_login_state(LoginStatus.PROCESSING_LOGIN, step="Mengisi Password...")
+        if not self._set_edit_text_safe(1, password, ld.get("password_edit_bounds"), mask_in_logs=True):
+            err_msg = "Gagal mengisi kolom Password di aplikasi Nusuk."
+            self.log_system(LogSeverity.ERROR, "AUTO_LOGIN", err_msg)
+            self._set_login_state(LoginStatus.AWAITING_CREDENTIALS, step=err_msg, error=err_msg)
+            return
+
+        if not self._sleep(0.20):
+            return
+
+        # Step 4: Hide IME keyboard if covering toggle/Login button, then refresh XML
+        fresh = self._inspect_screen(max_retries=0)
+        fresh_ld = fresh.get("login_data") or {}
+        if fresh.get("has_ime_overlay") or not self._in_viewport(fresh_ld.get("login_btn_bounds")):
+            self._press_hide_keyboard()
+            if not self._sleep(0.25):
+                return
+            fresh = self._inspect_screen(max_retries=0)
+
+        if self._stop_requested:
+            return
+
+        # Step 5: Ensure 'Remember me' toggle is OFF
+        fresh = self._ensure_remember_me_off(fresh)
+        if self._stop_requested:
+            return
+
+        # Step 6: Click 'Login' button
+        fresh_ld = fresh.get("login_data") or {}
+        login_bounds = fresh_ld.get("login_btn_bounds")
+        self._set_login_state(LoginStatus.PROCESSING_LOGIN, step="Menekan tombol Login — menunggu verifikasi server...")
+        self._click_bounds(login_bounds, fallback_xy=(360, 913))
+
+        # Step 7: Smart wait for OTP screen, Dashboard, or Credentials Error
+        if not self._sleep(0.4):
+            return
+        t_wait = time.monotonic()
+        retried_click = False
+
+        while time.monotonic() - t_wait < 20.0:
+            if self._stop_requested:
+                return
+            sub_info = self._inspect_screen(max_retries=0)
+            st = sub_info["state"]
+            elapsed = time.monotonic() - t_wait
+
+            if st == ScreenState.SCREEN_VERIFY_OTP_FORM:
+                self._prefetched_info = sub_info
+                self._login_alert_sent_state = None
+                self._set_login_state(
+                    LoginStatus.AWAITING_OTP,
+                    step="Kredensial valid! Menunggu kode OTP 4 digit dari operator...",
+                    clear_error=True,
+                )
+                self.log_system(LogSeverity.INFO, "AUTO_LOGIN", "Kredensial diterima Nusuk — masuk ke layar Verify Email (OTP).")
+                return
+
+            if st in AUTHENTICATED_STATES or st == ScreenState.SCREEN_LOCATION_POPUP:
+                self._prefetched_info = sub_info
+                self._login_alert_sent_state = None
+                self._set_login_state(
+                    LoginStatus.LOGGED_IN,
+                    step="Auto-Login berhasil! Masuk ke Dashboard Nusuk.",
+                    clear_error=True,
+                )
+                self.log_system(LogSeverity.INFO, "AUTO_LOGIN", f"Auto-Login berhasil untuk '{email}' (langsung ke Dashboard).")
+                self._alert("success", "Auto-Login berhasil! Melanjutkan otomatisasi.")
+                return
+
+            if st == ScreenState.SCREEN_CREDENTIALS_FORM:
+                sub_ld = sub_info.get("login_data") or {}
+                sub_err = sub_ld.get("error_msg") or ""
+                if sub_err:
+                    # Anti-stale guard when retrying right after a prior invalid credentials error
+                    if pre_submit_err and sub_err == pre_submit_err and elapsed < 2.5:
+                        if not self._sleep(0.25):
+                            return
+                        continue
+                    self.log_system(LogSeverity.WARNING, "AUTO_LOGIN", f"Login ditolak Nusuk untuk '{email}': {sub_err}")
+                    self._set_login_state(
+                        LoginStatus.AWAITING_CREDENTIALS,
+                        step=f"Login gagal: {sub_err}",
+                        error=sub_err,
+                    )
+                    self._alert("error", f"Auto-Login gagal: {sub_err}")
+                    self._prefetched_info = sub_info
+                    return
+
+                # Retry clicking Login button once if still sitting idle on form
+                if not retried_click and elapsed >= 3.0 and sub_ld.get("login_btn_enabled", True):
+                    self._click_bounds(sub_ld.get("login_btn_bounds"), fallback_xy=(360, 913))
+                    retried_click = True
+
+            elif st == ScreenState.SCREEN_UNKNOWN_OR_LOADING:
+                self._check_still_online(force=False)
+
+            if not self._sleep(0.25):
+                return
+
+        timeout_err = "Respon login Nusuk timeout (20 dtk). Periksa email/password dan coba lagi."
+        self.log_system(LogSeverity.WARNING, "AUTO_LOGIN", timeout_err)
+        self._set_login_state(LoginStatus.AWAITING_CREDENTIALS, step=timeout_err, error=timeout_err)
+
+    def _handle_screen_awaiting_credentials(self, info: Dict[str, Any]):
+        """Wait on Login Main / Method Popup / Session Timed Out / Credentials Form until operator sends credentials."""
+        state = info["state"]
+        creds = instance_manager.consume_login_credentials(self.uuid)
+        if creds:
+            self._fill_credentials_and_submit(info, creds["email"], creds["password"])
+            return
+
+        rt = instance_manager.rt(self.uuid)
+        existing_err = rt.login_error
+        if state == ScreenState.SCREEN_CREDENTIALS_FORM:
+            xml_err = (info.get("login_data") or {}).get("error_msg") or ""
+            if xml_err:
+                existing_err = xml_err
+
+        step_map = {
+            ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT: "Sesi berakhir (Session Timed Out) — menunggu Auto-Login dari operator...",
+            ScreenState.SCREEN_LOGIN_MAIN: "Belum login — menunggu Email & Password (Auto-Login)...",
+            ScreenState.SCREEN_LOGIN_METHOD_POPUP: "Pop-up Login terdeteksi — menunggu Email & Password (Auto-Login)...",
+            ScreenState.SCREEN_CREDENTIALS_FORM: "Form Login terbuka — menunggu Email & Password dari operator...",
+        }
+        step_msg = step_map.get(state, "Menunggu Email & Password (Auto-Login)...")
+
+        self._set_login_state(
+            LoginStatus.AWAITING_CREDENTIALS,
+            step=step_msg,
+            error=existing_err,
+        )
+        if self._login_alert_sent_state != LoginStatus.AWAITING_CREDENTIALS:
+            self._login_alert_sent_state = LoginStatus.AWAITING_CREDENTIALS
+            self.log_system(LogSeverity.WARNING, "AUTO_LOGIN", f"Perangkat membutuhkan Auto-Login ({state}). Menunggu kredensial dari UI Web.")
+            self._alert("warning", "Auto-Login dibutuhkan! Klik tombol 'Auto Login Required' untuk memasukkan Email & Password.")
+
+        wait_res = self._wait_for_login_event(
+            rt.credentials_event,
+            expected_states={
+                ScreenState.SCREEN_LOGIN_MAIN,
+                ScreenState.SCREEN_LOGIN_METHOD_POPUP,
+                ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT,
+                ScreenState.SCREEN_CREDENTIALS_FORM,
+            },
+        )
+        if wait_res == "received" and not self._stop_requested:
+            creds = instance_manager.consume_login_credentials(self.uuid)
+            if creds:
+                fresh = self._inspect_screen(max_retries=1)
+                self._fill_credentials_and_submit(fresh, creds["email"], creds["password"])
+
+    def _fill_otp_and_submit(self, info: Dict[str, Any], otp_code: str):
+        """Fill the 4 separate OTP EditText boxes (verified from 10/11 XML dumps) and press Verify Your Email."""
+        digits = "".join(ch for ch in str(otp_code) if ch.isdigit())
+        if len(digits) < 4:
+            err_msg = "Kode OTP harus terdiri dari 4 digit angka."
+            self._set_login_state(LoginStatus.AWAITING_OTP, step=err_msg, error=err_msg)
+            return
+        digits = digits[:4]
+
+        self._set_login_state(
+            LoginStatus.PROCESSING_LOGIN,
+            step="Mengisi kode OTP 4 digit...",
+            clear_error=True,
+        )
+        self.log_system(LogSeverity.INFO, "AUTO_LOGIN", "Menerima kode OTP 4 digit dari operator — mengisi kolom verifikasi...")
+
+        otp_data = info.get("otp_data") or {}
+        pre_submit_err = otp_data.get("error_msg") or ""
+        otp_inputs = otp_data.get("otp_inputs") or []
+
+        if len(otp_inputs) >= 4:
+            for idx in range(4):
+                if self._stop_requested:
+                    return
+                ok = self._set_edit_text_safe(idx, digits[idx], otp_inputs[idx].get("bounds"), mask_in_logs=True)
+                if not ok:
+                    err_msg = f"Gagal mengisi digit OTP ke-{idx + 1}."
+                    self.log_system(LogSeverity.ERROR, "AUTO_LOGIN", err_msg)
+                    self._set_login_state(LoginStatus.AWAITING_OTP, step=err_msg, error=err_msg)
+                    return
+                if not self._sleep(0.08):
+                    return
+        else:
+            # Fallback if future app update consolidates OTP into a single EditText
+            first_bounds = otp_inputs[0].get("bounds") if otp_inputs else None
+            if not self._set_edit_text_safe(0, digits, first_bounds, mask_in_logs=True):
+                err_msg = "Gagal mengisi kolom kode OTP."
+                self.log_system(LogSeverity.ERROR, "AUTO_LOGIN", err_msg)
+                self._set_login_state(LoginStatus.AWAITING_OTP, step=err_msg, error=err_msg)
+                return
+
+        if not self._sleep(0.20):
+            return
+
+        # Re-inspect to check keyboard overlay & fresh "Verify Your Email" button bounds
+        fresh = self._inspect_screen(max_retries=0)
+        fresh_otp = fresh.get("otp_data") or {}
+        if fresh.get("has_ime_overlay") or not self._in_viewport(fresh_otp.get("verify_bounds")):
+            self._press_hide_keyboard()
+            if not self._sleep(0.25):
+                return
+            fresh = self._inspect_screen(max_retries=0)
+            fresh_otp = fresh.get("otp_data") or {}
+
+        if self._stop_requested:
+            return
+
+        self._set_login_state(LoginStatus.PROCESSING_LOGIN, step="Menekan 'Verify Your Email' — memverifikasi OTP...")
+        self._click_bounds(fresh_otp.get("verify_bounds"), fallback_xy=(360, 855))
+
+        if not self._sleep(0.4):
+            return
+        t_wait = time.monotonic()
+        retried_verify = False
+
+        while time.monotonic() - t_wait < 22.0:
+            if self._stop_requested:
+                return
+            sub_info = self._inspect_screen(max_retries=0)
+            st = sub_info["state"]
+            elapsed = time.monotonic() - t_wait
+
+            if st in AUTHENTICATED_STATES or st == ScreenState.SCREEN_LOCATION_POPUP:
+                self._prefetched_info = sub_info
+                self._login_alert_sent_state = None
+                self._set_login_state(
+                    LoginStatus.LOGGED_IN,
+                    step="Auto-Login berhasil! Masuk ke Dashboard Nusuk.",
+                    clear_error=True,
+                )
+                self.log_system(LogSeverity.INFO, "AUTO_LOGIN", "Verifikasi OTP berhasil! Akun kini masuk ke Dashboard Nusuk.")
+                self._alert("success", "Auto-Login & verifikasi OTP berhasil! Melanjutkan otomatisasi.")
+                return
+
+            if st == ScreenState.SCREEN_VERIFY_OTP_FORM:
+                sub_otp = sub_info.get("otp_data") or {}
+                sub_err = sub_otp.get("error_msg") or ""
+                if sub_err:
+                    if pre_submit_err and sub_err == pre_submit_err and elapsed < 2.5:
+                        if not self._sleep(0.25):
+                            return
+                        continue
+                    self.log_system(LogSeverity.WARNING, "AUTO_LOGIN", f"Verifikasi OTP ditolak Nusuk: {sub_err}")
+                    self._set_login_state(
+                        LoginStatus.AWAITING_OTP,
+                        step=f"OTP ditolak: {sub_err}",
+                        error=sub_err,
+                    )
+                    self._alert("error", f"Verifikasi OTP gagal: {sub_err}")
+                    self._prefetched_info = sub_info
+                    return
+
+                if not retried_verify and elapsed >= 3.0 and sub_otp.get("verify_enabled", True):
+                    self._click_bounds(sub_otp.get("verify_bounds"), fallback_xy=(360, 855))
+                    retried_verify = True
+
+            elif st in (
+                ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT,
+                ScreenState.SCREEN_LOGIN_MAIN,
+                ScreenState.SCREEN_CREDENTIALS_FORM,
+            ):
+                self._prefetched_info = sub_info
+                return
+
+            elif st == ScreenState.SCREEN_UNKNOWN_OR_LOADING:
+                self._check_still_online(force=False)
+
+            if not self._sleep(0.25):
+                return
+
+        timeout_err = "Verifikasi OTP timeout (22 dtk). Periksa kode OTP dan coba lagi."
+        self.log_system(LogSeverity.WARNING, "AUTO_LOGIN", timeout_err)
+        self._set_login_state(LoginStatus.AWAITING_OTP, step=timeout_err, error=timeout_err)
+
+    def _handle_screen_verify_otp(self, info: Dict[str, Any]):
+        """Wait on Verify Email OTP screen until operator submits 4-digit OTP via UI Web."""
+        otp_code = instance_manager.consume_login_otp(self.uuid)
+        if otp_code:
+            self._fill_otp_and_submit(info, otp_code)
+            return
+
+        rt = instance_manager.rt(self.uuid)
+        xml_err = (info.get("otp_data") or {}).get("error_msg") or ""
+        existing_err = xml_err or rt.login_error
+
+        self._set_login_state(
+            LoginStatus.AWAITING_OTP,
+            step="Menunggu kode OTP 4 digit dari operator...",
+            error=existing_err,
+        )
+        if self._login_alert_sent_state != LoginStatus.AWAITING_OTP:
+            self._login_alert_sent_state = LoginStatus.AWAITING_OTP
+            self.log_system(LogSeverity.INFO, "AUTO_LOGIN", "Layar Verify Email aktif — menunggu kode OTP 4 digit dari UI Web.")
+            self._alert("warning", "Kode OTP 4 digit dibutuhkan! Masukkan OTP melalui modal Auto-Login.")
+
+        wait_res = self._wait_for_login_event(
+            rt.otp_event,
+            expected_states={ScreenState.SCREEN_VERIFY_OTP_FORM},
+        )
+        if wait_res == "received" and not self._stop_requested:
+            otp_code = instance_manager.consume_login_otp(self.uuid)
+            if otp_code:
+                fresh = self._inspect_screen(max_retries=1)
+                if fresh["state"] == ScreenState.SCREEN_VERIFY_OTP_FORM:
+                    self._fill_otp_and_submit(fresh, otp_code)
+                else:
+                    self._prefetched_info = fresh
+
     # ------------------------------------------------------------------ MAIN WORKER LOOP
     def _run_loop(self):
         logger.info(f"Worker [{self.name}] started in mode '{self.active_mode}' on {self.device_id}")
@@ -1378,8 +1910,26 @@ class InstanceWorker:
                     self.consecutive_recoveries = 0
                     self.unknown_first_seen_time = None
 
+                # Confirm LOGGED_IN whenever worker reaches any authenticated screen
+                if state in AUTHENTICATED_STATES:
+                    rt = instance_manager.rt(self.uuid)
+                    if rt.login_status != LoginStatus.LOGGED_IN or rt.login_error:
+                        self._login_alert_sent_state = None
+                        self._set_login_state(LoginStatus.LOGGED_IN, clear_error=True)
+
                 if state == ScreenState.SCREEN_LAUNCHER_OR_CLOSED:
                     self._execute_auto_recovery("Nusuk app was closed or crashed")
+                elif state == ScreenState.SCREEN_WELCOME_SLIDES:
+                    self._handle_screen_welcome_slides(info)
+                elif state in (
+                    ScreenState.SCREEN_LOGIN_MAIN,
+                    ScreenState.SCREEN_LOGIN_METHOD_POPUP,
+                    ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT,
+                    ScreenState.SCREEN_CREDENTIALS_FORM,
+                ):
+                    self._handle_screen_awaiting_credentials(info)
+                elif state == ScreenState.SCREEN_VERIFY_OTP_FORM:
+                    self._handle_screen_verify_otp(info)
                 elif state == ScreenState.SCREEN_DAILY_LIMIT_POPUP:
                     self._handle_screen_daily_limit_popup(info)
                 elif state == ScreenState.SCREEN_LOCATION_POPUP:
@@ -1431,18 +1981,33 @@ class InstanceWorker:
                 self.log_system(LogSeverity.ERROR, "BOT_ENGINE", f"Unhandled engine exception: {e}\n{tb_str[:400]}")
                 self.final_status = self.final_status or "ERROR"
         finally:
-            # Rollback FIRST (DB only, works even when ADB is gone), then optional cleanup.
+            # Rollback FIRST (DB only, works even when ADB is gone), then scrub any pending login secrets.
             self._safe_rollback_key()
+            instance_manager.clear_login_inputs(self.uuid)
             if went_offline:
                 self.is_running = False
                 self.active_mode = None
                 instance_manager.mark_offline(self.uuid, "terputus saat bot berjalan")
             else:
-                if self._stop_requested and self._return_to_home_on_stop:
+                cur_login_st = instance_manager.rt(self.uuid).login_status
+                in_login_flow = cur_login_st in (
+                    LoginStatus.LOGGED_OUT,
+                    LoginStatus.AWAITING_CREDENTIALS,
+                    LoginStatus.AWAITING_OTP,
+                    LoginStatus.PROCESSING_LOGIN,
+                )
+                if self._stop_requested and self._return_to_home_on_stop and not in_login_flow:
                     self._return_to_homepage()
                 self.is_running = False
                 self.active_mode = None
                 if not self._for_switch:
+                    if in_login_flow:
+                        instance_manager.set_runtime(
+                            self.uuid,
+                            emit=False,
+                            login_status=LoginStatus.LOGGED_OUT,
+                            login_error=None,
+                        )
                     final = self.final_status or "IDLE"
                     final_step = (
                         self._custom_stop_step or "Bot stopped."

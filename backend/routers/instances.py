@@ -4,10 +4,10 @@ from fastapi import APIRouter, HTTPException, Response
 from backend.config import settings
 from backend.schemas import (
     ActionResponse, InstanceTestRequest, InstancePairRequest, InstanceCreateRequest,
-    InstanceUpdateRequest, InstanceStartRequest,
+    InstanceUpdateRequest, InstanceStartRequest, LoginCredentialsRequest, LoginOtpRequest,
 )
 from backend.adb_manager import adb_manager
-from backend.instance_manager import instance_manager
+from backend.instance_manager import instance_manager, LoginStatus
 from backend.orchestrator import orchestrator, AI_MODES
 
 logger = logging.getLogger(__name__)
@@ -172,6 +172,68 @@ def reconnect_instance(device_uuid: str):
     if ok:
         return ActionResponse(success=True, message=f"Berhasil terhubung ke {inst.name} ({inst.address})")
     raise HTTPException(status_code=503, detail=f"Gagal terhubung ke {inst.name} ({inst.address})")
+
+
+@router.post("/{device_uuid}/login-credentials", response_model=ActionResponse)
+def submit_login_credentials(device_uuid: str, payload: LoginCredentialsRequest):
+    """Inject Email & Password into a running worker currently in AWAITING_CREDENTIALS state."""
+    inst = instance_manager.get_instance(device_uuid)
+    if not inst:
+        raise HTTPException(status_code=404, detail="Instance tidak ditemukan")
+
+    rt = instance_manager.rt(device_uuid)
+    if not orchestrator.is_active(device_uuid):
+        raise HTTPException(status_code=409, detail="Worker pada instance ini tidak sedang berjalan.")
+    if rt.login_status != LoginStatus.AWAITING_CREDENTIALS:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Instance tidak sedang menunggu kredensial (login_status saat ini: {rt.login_status}).",
+        )
+
+    email = (payload.email or "").strip()
+    password = payload.password or ""
+    if "@" not in email or len(email) < 4:
+        raise HTTPException(status_code=400, detail="Format alamat email tidak valid.")
+    if not password:
+        raise HTTPException(status_code=400, detail="Password tidak boleh kosong.")
+
+    # SECURITY: Never log `password` in plaintext
+    logger.info(f"Auto-Login credentials received for instance [{inst.name}] (email='{email}', password=****)")
+    instance_manager.submit_login_credentials(device_uuid, email=email, password=password)
+    return ActionResponse(
+        success=True,
+        message=f"Kredensial untuk {inst.name} diterima — sedang memproses Auto-Login...",
+        data={"device_uuid": device_uuid, "login_status": LoginStatus.PROCESSING_LOGIN},
+    )
+
+
+@router.post("/{device_uuid}/login-otp", response_model=ActionResponse)
+def submit_login_otp(device_uuid: str, payload: LoginOtpRequest):
+    """Inject 4-digit OTP code into a running worker currently in AWAITING_OTP state."""
+    inst = instance_manager.get_instance(device_uuid)
+    if not inst:
+        raise HTTPException(status_code=404, detail="Instance tidak ditemukan")
+
+    rt = instance_manager.rt(device_uuid)
+    if not orchestrator.is_active(device_uuid):
+        raise HTTPException(status_code=409, detail="Worker pada instance ini tidak sedang berjalan.")
+    if rt.login_status != LoginStatus.AWAITING_OTP:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Instance tidak sedang menunggu kode OTP (login_status saat ini: {rt.login_status}).",
+        )
+
+    otp_digits = "".join(ch for ch in (payload.otp_code or "") if ch.isdigit())
+    if len(otp_digits) != 4:
+        raise HTTPException(status_code=400, detail="Kode OTP harus tepat 4 digit angka.")
+
+    logger.info(f"Auto-Login OTP received for instance [{inst.name}] (otp=****)")
+    instance_manager.submit_login_otp(device_uuid, otp_code=otp_digits)
+    return ActionResponse(
+        success=True,
+        message=f"Kode OTP untuk {inst.name} diterima — sedang memverifikasi akun...",
+        data={"device_uuid": device_uuid, "login_status": LoginStatus.PROCESSING_LOGIN},
+    )
 
 
 @router.get("/{device_uuid}/screenshot")

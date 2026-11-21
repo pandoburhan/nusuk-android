@@ -1,14 +1,20 @@
+import asyncio
 import os
 import re
 import subprocess
 import time
 import logging
 from typing import Optional, Tuple, Dict, List, Any
-from backend.config import settings
+from backend.config import settings, PROJECT_ROOT, resolve_adb_binary
 
 logger = logging.getLogger(__name__)
 
 ANCHOR_REMOTE_PATH = "/sdcard/.nusuk_device_uuid"
+NUSUK_SPLIT_APKS = (
+    "base.apk",
+    "split_config.x86_64.apk",
+    "split_config.xhdpi.apk",
+)
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _TCP_SERIAL_RE = re.compile(r"^[^:\s]+:\d{1,5}$")
 _MDNS_ADDR_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})")
@@ -22,7 +28,7 @@ class ADBManager:
     """
 
     def __init__(self, adb_path: Optional[str] = None):
-        self.adb_path = os.path.abspath(adb_path or settings.adb_path)
+        self.adb_path = resolve_adb_binary(adb_path or settings.adb_path)
         os.environ["ADBUTILS_ADB_PATH"] = self.adb_path
 
     # ---------- low level ----------
@@ -268,6 +274,217 @@ class ADBManager:
     def reboot(self, target: str) -> bool:
         code, _, _ = self.run_adb(["-s", target, "reboot"], timeout=10)
         return code == 0
+
+    def install_multiple(self, target: str, apk_paths: List[str], timeout: int = 180) -> Tuple[bool, str]:
+        """Installs split APKs onto target via `adb -s <target> install-multiple <apks...>`."""
+        missing = [p for p in apk_paths if not os.path.isfile(p)]
+        if missing:
+            return False, f"File APK tidak ditemukan: {', '.join(missing)}"
+        rc, out, err = self.run_adb(["-s", target, "install-multiple", "-r"] + list(apk_paths), timeout=timeout)
+        combined = " ".join(p for p in (out, err) if p).strip()
+        ok = rc == 0 and "success" in combined.lower()
+        return ok, combined or (f"exit code {rc}")
+
+    # ---------- Redroid Auto-Provisioning ----------
+    def provision_redroid_sync(
+        self,
+        adb_port: int,
+        container_id: str,
+        container_name: str,
+        device_uuid: str,
+        display_name: Optional[str] = None,
+        adb_wait_timeout: int = 120,
+    ) -> Dict[str, Any]:
+        """
+        Post-deployment auto-provisioning worker for a newly launched Redroid container:
+          1. Wait until `adb connect 127.0.0.1:<adb_port>` succeeds and Android boot completes.
+          2. Plant anchor file `/sdcard/.nusuk_device_uuid`.
+          3. Install Nusuk split APKs from `Nusuk_Backup/`.
+          4. Register new `tcp` instance (`127.0.0.1:<adb_port>`) in MySQL `instances` table
+             and broadcast WebSocket `redroid_provisioning_event` + `device_list_update`.
+        """
+        from backend.database import SessionLocal
+        from backend.models import Instance, LogSeverity
+        from backend.event_log import log_event, set_device_name
+        from backend.telemetry import telemetry_manager
+        from backend.time_service import utc_now_naive
+        from backend.instance_manager import instance_manager, Runtime
+
+        target = f"127.0.0.1:{int(adb_port)}"
+        inst_name = (display_name or "").strip()[:64] or f"Redroid-{adb_port}"
+
+        def emit_progress(stage: str, status: str, message: str, **extra):
+            payload = {
+                "stage": stage,
+                "status": status,
+                "title": f"Redroid ({inst_name})",
+                "message": message,
+                "container_id": container_id,
+                "container_name": container_name,
+                "adb_port": int(adb_port),
+                "adb_serial": target,
+                "device_uuid": device_uuid,
+                **extra,
+            }
+            telemetry_manager.emit_sync("redroid_provisioning_event", payload)
+
+        try:
+            # 1. Wait for ADB connection & Android boot completion
+            emit_progress("waiting_adb", "progress", f"Waiting for ADB on {target}...")
+            log_event(
+                LogSeverity.INFO,
+                "REDROID",
+                f"Auto-provisioning container '{container_name}' ({target}): menunggu ADB siap...",
+                None,
+            )
+
+            deadline = time.time() + max(30, int(adb_wait_timeout))
+            adb_ready = False
+            while time.time() < deadline:
+                self.connect(target, timeout=5)
+                if self.is_ready(target):
+                    code_boot, out_boot, _ = self.shell(target, "getprop sys.boot_completed", timeout=5)
+                    if code_boot == 0 and out_boot.strip() == "1":
+                        code_pm, out_pm, _ = self.shell(target, "pm path android", timeout=5)
+                        if code_pm == 0 and "package:" in out_pm:
+                            adb_ready = True
+                            break
+                time.sleep(2.5)
+
+            if not adb_ready:
+                raise TimeoutError(
+                    f"Redroid container '{container_name}' did not become ready via ADB ({target}) within {adb_wait_timeout}s."
+                )
+
+            # 2. Plant anchor file (/sdcard/.nusuk_device_uuid)
+            emit_progress("planting_anchor", "progress", f"ADB connected ({target}). Planting device identity anchor...")
+            anchor_ok = False
+            for _ in range(10):
+                if self.write_anchor(target, device_uuid):
+                    anchor_ok = True
+                    break
+                time.sleep(1.5)
+            if not anchor_ok:
+                logger.warning(f"Failed to verify anchor on {target}; continuing provisioning.")
+
+            # 3. Install Nusuk Split APKs from Nusuk_Backup/
+            emit_progress("installing_apk", "progress", f"Installing Nusuk app (Split APKs) onto {inst_name}...")
+            backup_dir = os.path.join(PROJECT_ROOT, "Nusuk_Backup")
+            apk_paths = [os.path.join(backup_dir, fname) for fname in NUSUK_SPLIT_APKS]
+            ok_install, install_msg = self.install_multiple(target, apk_paths, timeout=180)
+            if not ok_install:
+                raise RuntimeError(f"Gagal menginstal Nusuk APK di {target}: {install_msg}")
+
+            nusuk_installed = self.is_package_installed(target)
+            if not nusuk_installed:
+                raise RuntimeError(f"Instalasi APK selesai tetapi paket {settings.nusuk_package} tidak terdeteksi.")
+
+            # 4. Register instance in MySQL `instances` table
+            emit_progress("registering_db", "progress", f"Registering {inst_name} ({target}) in database...")
+            db = SessionLocal()
+            try:
+                existing = (
+                    db.query(Instance)
+                    .filter(Instance.adb_serial == target, Instance.is_deleted == False)  # noqa: E712
+                    .first()
+                )
+                if existing:
+                    existing.name = inst_name
+                    existing.connection_type = "tcp"
+                    existing.ip = "127.0.0.1"
+                    existing.port = int(adb_port)
+                    existing.nusuk_installed = True
+                    existing.anchor_planted = anchor_ok
+                    existing.last_seen_at = utc_now_naive()
+                    row = existing
+                    device_uuid = row.uuid
+                else:
+                    row = Instance(
+                        uuid=device_uuid,
+                        name=inst_name,
+                        connection_type="tcp",
+                        adb_serial=target,
+                        ip="127.0.0.1",
+                        port=int(adb_port),
+                        live_preview_enabled=True,
+                        nusuk_installed=True,
+                        anchor_planted=anchor_ok,
+                        is_legacy_primary=False,
+                        last_seen_at=utc_now_naive(),
+                        created_at=utc_now_naive(),
+                    )
+                    db.add(row)
+                db.commit()
+                db.refresh(row)
+
+                set_device_name(row.uuid, row.name)
+                with instance_manager._lock:
+                    instance_manager.runtime[row.uuid] = Runtime(last_app_keys=row.last_app_keys)
+                instance_manager.set_runtime(
+                    row.uuid,
+                    status="IDLE",
+                    current_step="Siap digunakan",
+                    offline_logged=False,
+                    last_seen_at=utc_now_naive(),
+                )
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
+            log_event(
+                LogSeverity.INFO,
+                "REDROID",
+                f"Redroid instance '{inst_name}' ({target}) selesai di-provision & siap digunakan.",
+                device_uuid,
+            )
+            instance_manager.emit_device_list()
+            emit_progress(
+                "ready",
+                "ready",
+                f"Redroid instance '{inst_name}' ({target}) is Ready!",
+                instance_name=inst_name,
+            )
+            return {
+                "success": True,
+                "device_uuid": device_uuid,
+                "name": inst_name,
+                "adb_serial": target,
+                "adb_port": int(adb_port),
+                "container_id": container_id,
+                "container_name": container_name,
+            }
+        except Exception as e:
+            logger.exception(f"Redroid provisioning failed for {container_name} ({target}): {e}")
+            log_event(
+                LogSeverity.ERROR,
+                "REDROID",
+                f"Auto-provisioning Redroid '{inst_name}' ({target}) gagal: {e}",
+                None,
+            )
+            emit_progress("error", "error", f"Provisioning failed for {inst_name}: {e}")
+            raise
+
+    async def provision_redroid_instance(
+        self,
+        adb_port: int,
+        container_id: str,
+        container_name: str,
+        device_uuid: str,
+        display_name: Optional[str] = None,
+        adb_wait_timeout: int = 120,
+    ) -> Dict[str, Any]:
+        """Async wrapper executing Redroid auto-provisioning without blocking the FastAPI event loop."""
+        return await asyncio.to_thread(
+            self.provision_redroid_sync,
+            adb_port,
+            container_id,
+            container_name,
+            device_uuid,
+            display_name,
+            adb_wait_timeout,
+        )
 
     # ---------- screenshot (callers MUST check live_preview_enabled first) ----------
     def take_screenshot_bytes(self, target: str) -> Optional[bytes]:

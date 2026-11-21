@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   X, CheckCircle2, XCircle, AlertTriangle, Loader2, Plug, Save, Info,
-  Monitor, Usb, Wifi, RefreshCw, Link2, Smartphone,
+  Monitor, Usb, Wifi, RefreshCw, Link2, Smartphone, Box, Download, Rocket, Trash2,
 } from 'lucide-react';
-import { instancesApi, errorDetail } from '../api/client';
+import { instancesApi, redroidApi, errorDetail } from '../api/client';
 import { ConnectionBadge } from './common';
 
 const Line = ({ ok, warn, children }) => (
@@ -25,10 +25,11 @@ const TABS = [
   { id: 'tcp', label: 'IP & Port', icon: Monitor, sub: 'Emulator / TCP' },
   { id: 'usb', label: 'USB Debugging', icon: Usb, sub: 'Scan HP Fisik' },
   { id: 'wireless', label: 'Wireless Pair', icon: Wifi, sub: 'Android 11+' },
+  { id: 'redroid', label: 'Redroid', icon: Box, sub: 'Linux Only' },
 ];
 
-export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
-  const [tab, setTab] = useState('tcp'); // 'tcp' | 'usb' | 'wireless'
+export default function AddDeviceModal({ onClose, toast, refreshInstances, lastRedroidEvent }) {
+  const [tab, setTab] = useState('tcp'); // 'tcp' | 'usb' | 'wireless' | 'redroid'
 
   // Shared alias & check/save state
   const [name, setName] = useState('');
@@ -55,6 +56,14 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
   const [pairInfo, setPairInfo] = useState(null); // { success, message, suggested_connect_port }
   const [connectPort, setConnectPort] = useState('');
 
+  // Tab 4: Redroid (Linux Only)
+  const [redroidLoading, setRedroidLoading] = useState(false);
+  const [redroidStatus, setRedroidStatus] = useState(null);
+  const [pullingImage, setPullingImage] = useState(false);
+  const [pullProgressMsg, setPullProgressMsg] = useState('');
+  const [deployingRedroid, setDeployingRedroid] = useState(false);
+  const [destroyingId, setDestroyingId] = useState(null);
+
   const resetResult = useCallback(() => {
     setResult(null);
     setForceNew(false);
@@ -80,11 +89,108 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
     }
   }, []);
 
+  // Load Redroid / Docker status
+  const loadRedroidStatus = useCallback(async () => {
+    setRedroidLoading(true);
+    setError('');
+    try {
+      const res = await redroidApi.getStatus();
+      const d = res.data;
+      setRedroidStatus(d);
+      setPullingImage(Boolean(d?.pulling_image));
+      if (d?.pull_status) setPullProgressMsg(d.pull_status);
+    } catch (e) {
+      setRedroidStatus(null);
+      setError(errorDetail(e, 'Gagal memeriksa status Redroid / Docker'));
+    } finally {
+      setRedroidLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (tab === 'usb') {
       scanDevices();
+    } else if (tab === 'redroid') {
+      loadRedroidStatus();
     }
-  }, [tab, scanDevices]);
+  }, [tab, scanDevices, loadRedroidStatus]);
+
+  // Listen to WebSocket Redroid pull progress while modal is open
+  useEffect(() => {
+    if (!lastRedroidEvent || tab !== 'redroid') return;
+    if (lastRedroidEvent.stage === 'pull_image') {
+      if (lastRedroidEvent.message) setPullProgressMsg(lastRedroidEvent.message);
+      if (lastRedroidEvent.status === 'success' || lastRedroidEvent.status === 'error') {
+        setPullingImage(false);
+        loadRedroidStatus();
+      } else {
+        setPullingImage(true);
+      }
+    } else if (lastRedroidEvent.status === 'ready') {
+      loadRedroidStatus();
+    }
+  }, [lastRedroidEvent, tab, loadRedroidStatus]);
+
+  const handleInstallRedroidImage = async () => {
+    setPullingImage(true);
+    setPullProgressMsg('Memulai unduhan image redroid/redroid:9.0.0-latest...');
+    setError('');
+    try {
+      const res = await redroidApi.installImage();
+      const d = res.data;
+      if (d?.data?.already_exists) {
+        setPullingImage(false);
+        await loadRedroidStatus();
+      } else {
+        toast?.({
+          type: 'info',
+          title: 'Redroid Image',
+          message: d?.message || 'Mengunduh image Redroid di latar belakang...',
+        });
+      }
+    } catch (e) {
+      setPullingImage(false);
+      setError(errorDetail(e, 'Gagal memulai instalasi image Redroid'));
+    }
+  };
+
+  const handleDeployRedroid = async () => {
+    setDeployingRedroid(true);
+    setError('');
+    try {
+      const payload = name.trim() ? { name: name.trim() } : {};
+      await redroidApi.deployInstance(payload);
+      toast?.({
+        type: 'success',
+        title: 'Redroid Deploy',
+        message: 'Deploying new instance in the background. It will appear on the dashboard soon.',
+      });
+      onClose();
+    } catch (e) {
+      setError(errorDetail(e, 'Gagal men-deploy instance Redroid'));
+    } finally {
+      setDeployingRedroid(false);
+    }
+  };
+
+  const handleDestroyRedroid = async (containerId, containerName) => {
+    setDestroyingId(containerId);
+    setError('');
+    try {
+      await redroidApi.destroyInstance(containerId);
+      toast?.({
+        type: 'success',
+        title: 'Redroid',
+        message: `Container ${containerName} berhasil dihentikan & dihapus.`,
+      });
+      refreshInstances?.();
+      await loadRedroidStatus();
+    } catch (e) {
+      setError(errorDetail(e, 'Gagal menghapus container Redroid'));
+    } finally {
+      setDestroyingId(null);
+    }
+  };
 
   // Tab 1 test
   const portNum = parseInt(port, 10);
@@ -227,22 +333,27 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-5 shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto">
         <div className="flex items-center justify-between border-b border-slate-800 pb-3">
           <div>
             <h3 className="text-sm font-semibold text-white">Tambah Instance / Perangkat Android</h3>
-            <p className="text-[11px] text-slate-400">Mendukung Emulator TCP/IP, HP Fisik USB, dan Wireless Debugging</p>
+            <p className="text-[11px] text-slate-400">Mendukung Emulator TCP/IP, HP Fisik USB, Wireless Debugging &amp; Redroid Linux</p>
           </div>
           <button onClick={onClose} className="text-slate-400 hover:text-white">
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* 3-Tab Connection Method Switcher */}
-        <div className="grid grid-cols-3 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
+        {/* 4-Tab Connection Method Switcher */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
           {TABS.map((t) => {
             const Icon = t.icon;
             const active = tab === t.id;
+            const activeCls =
+              t.id === 'redroid'
+                ? 'bg-indigo-600 text-white shadow'
+                : 'bg-emerald-600 text-white shadow';
+            const subActiveCls = t.id === 'redroid' ? 'text-indigo-100' : 'text-emerald-100';
             return (
               <button
                 key={t.id}
@@ -250,7 +361,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
                 onClick={() => switchTab(t.id)}
                 className={`px-2 py-2 rounded-lg font-medium transition flex flex-col items-center gap-0.5 ${
                   active
-                    ? 'bg-emerald-600 text-white shadow'
+                    ? activeCls
                     : 'text-slate-400 hover:text-white hover:bg-slate-900'
                 }`}
               >
@@ -258,7 +369,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
                   <Icon className="w-3.5 h-3.5" />
                   {t.label}
                 </span>
-                <span className={`text-[9px] ${active ? 'text-emerald-100' : 'text-slate-500'}`}>{t.sub}</span>
+                <span className={`text-[9px] ${active ? subActiveCls : 'text-slate-500'}`}>{t.sub}</span>
               </button>
             );
           })}
@@ -276,7 +387,9 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
                   ? 'otomatis dari model HP (misal: Samsung A54)'
                   : tab === 'wireless'
                     ? 'contoh: HP-Utama-WiFi'
-                    : 'contoh: LD-01'
+                    : tab === 'redroid'
+                      ? 'contoh: Redroid-VPS-01 (otomatis jika kosong)'
+                      : 'contoh: LD-01'
               }
               onChange={(e) => setName(e.target.value)}
             />
@@ -534,13 +647,164 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
           </div>
         )}
 
+        {/* TAB 4: Redroid (Linux Only) */}
+        {tab === 'redroid' && (
+          <div className="space-y-3 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-slate-400">
+                Deploy emulator Android 9 headless instan via Docker Engine (Linux VPS).
+              </span>
+              <button
+                type="button"
+                onClick={loadRedroidStatus}
+                disabled={redroidLoading}
+                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-lg text-[11px] font-medium flex items-center gap-1 disabled:opacity-40 shrink-0"
+              >
+                <RefreshCw className={`w-3 h-3 ${redroidLoading ? 'animate-spin' : ''}`} />
+                Refresh
+              </button>
+            </div>
+
+            {redroidLoading && !redroidStatus ? (
+              <div className="py-8 text-center text-slate-400 bg-slate-950/70 border border-slate-800 rounded-xl flex flex-col items-center gap-2">
+                <Loader2 className="w-5 h-5 animate-spin text-indigo-400" />
+                <span>Memeriksa status OS, Docker Engine &amp; image Redroid…</span>
+              </div>
+            ) : !redroidStatus || !redroidStatus.supported || !redroidStatus.docker_available ? (
+              <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-700/50 space-y-2">
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <div className="font-semibold text-amber-200">
+                      Redroid deployment is only supported on Linux with Docker installed.
+                    </div>
+                    <div className="text-[11px] text-amber-300/80">
+                      Host OS terdeteksi: <span className="font-mono text-white">{redroidStatus?.os || 'Unknown'}</span>
+                      {redroidStatus?.error && redroidStatus.supported ? ` — ${redroidStatus.error}` : ''}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled
+                  className="w-full py-2.5 px-3 rounded-xl bg-slate-800 text-slate-500 border border-slate-700 font-semibold cursor-not-allowed flex items-center justify-center gap-1.5"
+                >
+                  <Rocket className="w-3.5 h-3.5" />
+                  Deploy New Instance (Android 9)
+                </button>
+              </div>
+            ) : !redroidStatus.image_exists ? (
+              <div className="p-4 rounded-xl bg-slate-950/80 border border-indigo-800/60 space-y-3">
+                <div className="space-y-1">
+                  <Line ok={true}>
+                    Docker Engine terhubung ({redroidStatus.os}).
+                  </Line>
+                  <Line warn>
+                    Image <span className="font-mono text-indigo-300">{redroidStatus.image_name}</span> belum terpasang di host ini.
+                  </Line>
+                </div>
+
+                {pullingImage && (
+                  <div className="p-2.5 rounded-lg bg-indigo-950/40 border border-indigo-700/50 text-indigo-200 text-[11px] flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin text-indigo-400 shrink-0" />
+                    <span className="truncate">{pullProgressMsg || 'Mengunduh image Redroid…'}</span>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleInstallRedroidImage}
+                  disabled={pullingImage}
+                  className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/20 transition"
+                >
+                  {pullingImage ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  {pullingImage ? 'Installing Redroid Image…' : 'Install Redroid Image'}
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="p-4 rounded-xl bg-slate-950/80 border border-indigo-700/50 space-y-3">
+                  <div className="space-y-1.5">
+                    <Line ok={true}>
+                      Docker Engine siap &amp; image <span className="font-mono text-indigo-300">{redroidStatus.image_name}</span> tersedia.
+                    </Line>
+                    <Line>
+                      Auto-provisioning: ADB connect otomatis, tanam UUID anchor, dan instal Split APKs Nusuk dari <span className="font-mono">Nusuk_Backup/</span>.
+                    </Line>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleDeployRedroid}
+                    disabled={deployingRedroid}
+                    className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/25 transition active:scale-[0.99]"
+                  >
+                    {deployingRedroid ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Rocket className="w-4 h-4" />
+                    )}
+                    {deployingRedroid ? 'Deploying…' : 'Deploy New Instance (Android 9)'}
+                  </button>
+
+                  <p className="text-[10px] text-slate-400 text-center font-mono">
+                    Default spec: 720x1280, 320DPI, 1 CPU, 1536MB RAM
+                  </p>
+                </div>
+
+                {/* Running Redroid Containers */}
+                {Array.isArray(redroidStatus.containers) && redroidStatus.containers.length > 0 && (
+                  <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
+                    <div className="text-[11px] font-semibold text-slate-300 flex items-center justify-between">
+                      <span>Active Redroid Containers ({redroidStatus.containers.length})</span>
+                    </div>
+                    <div className="space-y-1.5 max-h-36 overflow-y-auto pr-0.5">
+                      {redroidStatus.containers.map((c) => (
+                        <div
+                          key={c.container_id}
+                          className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px]"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-mono text-slate-200 truncate">{c.container_name}</div>
+                            <div className="text-[10px] text-slate-500 font-mono">
+                              {c.adb_serial || `port ${c.adb_port ?? '?'}`} · {c.status}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={destroyingId === c.container_id}
+                            onClick={() => handleDestroyRedroid(c.container_id, c.container_name)}
+                            className="px-2 py-1 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 text-[10px] font-medium flex items-center gap-1 disabled:opacity-40 shrink-0"
+                            title="Hentikan container & soft-delete instance"
+                          >
+                            {destroyingId === c.container_id ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Trash2 className="w-3 h-3" />
+                            )}
+                            Destroy
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {error && (
           <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-800/60 text-rose-300 text-[11px] break-words">
             {error}
           </div>
         )}
 
-        {result && (
+        {tab !== 'redroid' && result && (
           <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2">
             <Line ok={!!result.adb_ok}>
               ADB ({(result.connection_type || tab).toUpperCase()} · <span className="font-mono">{result.adb_serial}</span>):{' '}
@@ -598,16 +862,18 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances }) {
 
         <div className="flex justify-end gap-2 text-xs pt-1">
           <button onClick={onClose} className="px-4 py-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800">
-            Batal
+            {tab === 'redroid' ? 'Tutup' : 'Batal'}
           </button>
-          <button
-            onClick={save}
-            disabled={!canSave}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-semibold flex items-center gap-1.5"
-          >
-            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-            Simpan &amp; Tambahkan Instance
-          </button>
+          {tab !== 'redroid' && (
+            <button
+              onClick={save}
+              disabled={!canSave}
+              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl font-semibold flex items-center gap-1.5"
+            >
+              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+              Simpan &amp; Tambahkan Instance
+            </button>
+          )}
         </div>
       </div>
     </div>

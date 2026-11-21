@@ -29,6 +29,14 @@ VALID_CONN_TYPES = ("tcp", "usb", "wireless")
 _SERIAL_SAFE_RE = re.compile(r"^[A-Za-z0-9._:@/-]{2,120}$")
 
 
+class LoginStatus:
+    LOGGED_IN = "LOGGED_IN"
+    LOGGED_OUT = "LOGGED_OUT"
+    AWAITING_CREDENTIALS = "AWAITING_CREDENTIALS"
+    AWAITING_OTP = "AWAITING_OTP"
+    PROCESSING_LOGIN = "PROCESSING_LOGIN"
+
+
 class Runtime:
     def __init__(self, last_app_keys: Optional[int] = None):
         self.status = "OFFLINE"
@@ -49,6 +57,13 @@ class Runtime:
         self.stop_mode: str = "limit"
         self.stop_limit: int = 100
         self.session_completed_count: int = 0
+        # Auto-Login state & thread-safe operator handoff (in-memory only, never persisted)
+        self.login_status: str = LoginStatus.LOGGED_IN
+        self.login_error: Optional[str] = None
+        self.credentials_event = threading.Event()
+        self.pending_credentials: Optional[Dict[str, str]] = None
+        self.otp_event = threading.Event()
+        self.pending_otp: Optional[str] = None
 
 
 class InstanceManager:
@@ -86,13 +101,66 @@ class InstanceManager:
             "stop_mode": getattr(r, "stop_mode", "limit"),
             "stop_limit": getattr(r, "stop_limit", 100),
             "session_completed_count": getattr(r, "session_completed_count", 0),
+            "login_status": getattr(r, "login_status", LoginStatus.LOGGED_IN),
+            "login_error": getattr(r, "login_error", None),
         }
 
     def emit_status(self, device_uuid: str):
         telemetry_manager.emit_sync("status_update", self.status_payload(device_uuid))
 
+    # ------------------------------------------------------------------ auto-login handoff
+    def submit_login_credentials(self, device_uuid: str, email: str, password: str) -> None:
+        """Thread-safe injection of email/password from FastAPI into the waiting InstanceWorker."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            r.pending_credentials = {"email": email, "password": password}
+            r.login_error = None
+            r.login_status = LoginStatus.PROCESSING_LOGIN
+            r.current_step = "Kredensial diterima — memproses Auto-Login..."
+            r.credentials_event.set()
+        self.emit_status(device_uuid)
+
+    def consume_login_credentials(self, device_uuid: str) -> Optional[Dict[str, str]]:
+        """Atomically pop and clear pending credentials from memory."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            creds = r.pending_credentials
+            r.pending_credentials = None
+            r.credentials_event.clear()
+            return creds
+
+    def submit_login_otp(self, device_uuid: str, otp_code: str) -> None:
+        """Thread-safe injection of 4-digit OTP from FastAPI into the waiting InstanceWorker."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            r.pending_otp = otp_code
+            r.login_error = None
+            r.login_status = LoginStatus.PROCESSING_LOGIN
+            r.current_step = "Kode OTP diterima — memverifikasi akun..."
+            r.otp_event.set()
+        self.emit_status(device_uuid)
+
+    def consume_login_otp(self, device_uuid: str) -> Optional[str]:
+        """Atomically pop and clear pending OTP from memory."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            otp = r.pending_otp
+            r.pending_otp = None
+            r.otp_event.clear()
+            return otp
+
+    def clear_login_inputs(self, device_uuid: str) -> None:
+        """Scrub any unconsumed credentials/OTP from memory."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            r.pending_credentials = None
+            r.credentials_event.clear()
+            r.pending_otp = None
+            r.otp_event.clear()
+
     def mark_offline(self, device_uuid: str, reason: str = "terputus"):
         """RUNNING/IDLE -> OFFLINE with exactly ONE WARNING log until it comes back."""
+        self.clear_login_inputs(device_uuid)
         r = self.rt(device_uuid)
         first = not r.offline_logged
         self.set_runtime(device_uuid, status="OFFLINE", mode=None, start_time=None,
