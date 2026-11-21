@@ -1,12 +1,14 @@
+import os
 import logging
 from fastapi import APIRouter, HTTPException, Response
 
-from backend.config import settings
+from backend.config import settings, PROJECT_ROOT
 from backend.schemas import (
-    ActionResponse, InstanceTestRequest, InstancePairRequest, InstanceCreateRequest,
-    InstanceUpdateRequest, InstanceStartRequest, LoginCredentialsRequest, LoginOtpRequest,
+    ActionResponse, InstanceTestRequest, InstanceInstallAppRequest, InstancePairRequest,
+    InstanceCreateRequest, InstanceUpdateRequest, InstanceStartRequest,
+    LoginCredentialsRequest, LoginOtpRequest,
 )
-from backend.adb_manager import adb_manager
+from backend.adb_manager import adb_manager, NUSUK_SPLIT_APKS
 from backend.instance_manager import instance_manager, LoginStatus
 from backend.orchestrator import orchestrator, AI_MODES
 
@@ -59,6 +61,44 @@ def test_instance_connection(payload: InstanceTestRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/install-app", response_model=ActionResponse)
+def install_nusuk_app(payload: InstanceInstallAppRequest):
+    """Auto-installs Nusuk Split APKs from Nusuk_Backup/ onto any connected TCP/USB/Wireless device."""
+    try:
+        ct, _, _, target = instance_manager.resolve_connection(
+            payload.connection_type, payload.ip, payload.port, payload.adb_serial
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if ct == "usb":
+        st = adb_manager.device_states().get(target)
+        if st != "device":
+            raise HTTPException(
+                status_code=503,
+                detail=f"Perangkat USB '{target}' tidak siap di ADB (status: {st or 'tidak ditemukan'}).",
+            )
+    else:
+        if not adb_manager.ensure_connected(target, connection_type=ct):
+            raise HTTPException(
+                status_code=503,
+                detail=f"Gagal terhubung ke perangkat ADB '{target}'. Pastikan koneksi aktif.",
+            )
+
+    backup_dir = os.path.join(PROJECT_ROOT, "Nusuk_Backup")
+    apk_paths = [os.path.join(backup_dir, fname) for fname in NUSUK_SPLIT_APKS]
+    ok_install, install_msg = adb_manager.install_multiple(target, apk_paths, timeout=180)
+    if not ok_install:
+        raise HTTPException(status_code=400, detail=f"Gagal menginstal Nusuk APK: {install_msg}")
+
+    installed = adb_manager.is_package_installed(target)
+    return ActionResponse(
+        success=True,
+        message="Aplikasi Nusuk berhasil diinstal di perangkat.",
+        data={"adb_serial": target, "nusuk_installed": installed},
+    )
+
+
 @router.post("", response_model=ActionResponse)
 def add_instance(payload: InstanceCreateRequest):
     try:
@@ -69,6 +109,7 @@ def add_instance(payload: InstanceCreateRequest):
             connection_type=payload.connection_type,
             adb_serial=payload.adb_serial,
             force_new_uuid=payload.force_new_uuid,
+            bind_to_uuid=payload.bind_to_uuid,
         )
         if data.get("restored"):
             msg = f"Perangkat lama dipulihkan: {data['instance']['name']}"

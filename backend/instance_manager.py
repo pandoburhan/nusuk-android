@@ -521,15 +521,31 @@ class InstanceManager:
         connection_type: str = "tcp",
         adb_serial: Optional[str] = None,
         force_new_uuid: bool = False,
+        bind_to_uuid: Optional[str] = None,
     ) -> Dict[str, Any]:
         ct, ip_clean, port_val, target = self.resolve_connection(connection_type, ip, port, adb_serial)
+
+        clean_bind_uuid = (bind_to_uuid or "").strip().lower() or None
+        if clean_bind_uuid:
+            if not adb_manager.is_valid_uuid(clean_bind_uuid):
+                raise ValueError(f"Format UUID migrasi tidak valid: '{bind_to_uuid}'")
+            db_check = SessionLocal()
+            try:
+                target_row = db_check.query(Instance).filter(Instance.uuid == clean_bind_uuid).first()
+                if not target_row:
+                    raise ValueError(f"Target perangkat lama (UUID: {clean_bind_uuid}) tidak ditemukan di database.")
+            finally:
+                db_check.close()
+            if ct != "usb":
+                adb_manager.ensure_connected(target, connection_type=ct)
+            # Force overwrite device UUID anchor before reading/verifying anchor UUID
+            adb_manager.shell(target, f"echo -n {clean_bind_uuid} > /sdcard/.nusuk_device_uuid", timeout=8)
+
         info = self.test_connection(ip=ip_clean, port=port_val, connection_type=ct, adb_serial=target)
         if not info["adb_ok"]:
             raise PermissionError(info["message"])
         if info["already_registered"]:
             raise FileExistsError(info["message"])
-        if info["nusuk_installed"] is False:
-            raise PermissionError(info["message"])
         if info["clone_conflict"] and not force_new_uuid:
             raise FileExistsError(info["message"] + " Ulangi dengan opsi 'buat UUID baru'.")
 
@@ -554,7 +570,7 @@ class InstanceManager:
                 row.port = port_val
                 if name and name.strip():
                     row.name = name.strip()[:64]
-                row.nusuk_installed = True
+                row.nusuk_installed = bool(info.get("nusuk_installed"))
                 row.anchor_planted = True
                 dev_uuid = row.uuid
             else:
@@ -570,7 +586,7 @@ class InstanceManager:
                     ip=ip_clean,
                     port=port_val,
                     live_preview_enabled=True,
-                    nusuk_installed=True,
+                    nusuk_installed=bool(info.get("nusuk_installed")),
                     anchor_planted=False,
                     is_legacy_primary=False,
                     created_at=utc_now_naive(),

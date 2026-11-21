@@ -73,10 +73,17 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
   const [migrationTargets, setMigrationTargets] = useState([]);
   const [loadingMigrationTargets, setLoadingMigrationTargets] = useState(false);
 
+  // Auto-install Nusuk confirmation modal state
+  const [showInstallConfirm, setShowInstallConfirm] = useState(false);
+  const [installingApp, setInstallingApp] = useState(false);
+  const [allowSaveWithoutNusuk, setAllowSaveWithoutNusuk] = useState(false);
+
   const resetResult = useCallback(() => {
     setResult(null);
     setForceNew(false);
     setError('');
+    setShowInstallConfirm(false);
+    setAllowSaveWithoutNusuk(false);
   }, []);
 
   const switchTab = (next) => {
@@ -161,14 +168,17 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
   }, []);
 
   useEffect(() => {
+    loadMigrationTargets();
+  }, [loadMigrationTargets]);
+
+  useEffect(() => {
     if (tab === 'usb') {
       scanDevices();
     } else if (tab === 'redroid') {
       loadRedroidStatus();
       loadRedroidContainers();
-      loadMigrationTargets();
     }
-  }, [tab, scanDevices, loadRedroidStatus, loadRedroidContainers, loadMigrationTargets]);
+  }, [tab, scanDevices, loadRedroidStatus, loadRedroidContainers]);
 
   // Auto-poll container management table every 5s while Redroid tab is open
   useEffect(() => {
@@ -321,6 +331,49 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
     }
   };
 
+  const handleTestResult = useCallback((data) => {
+    setResult(data);
+    if (data?.adb_ok && data?.nusuk_installed === false && !data?.already_registered) {
+      setShowInstallConfirm(true);
+    }
+  }, []);
+
+  const handleInstallNusukApp = async () => {
+    if (!result) return;
+    setInstallingApp(true);
+    setError('');
+    try {
+      await instancesApi.installApp({
+        connection_type: result.connection_type || tab,
+        ip: result.ip || undefined,
+        port: result.port || undefined,
+        adb_serial: result.adb_serial || undefined,
+      });
+      setShowInstallConfirm(false);
+      setAllowSaveWithoutNusuk(false);
+      setResult((prev) =>
+        prev
+          ? {
+              ...prev,
+              nusuk_installed: true,
+              can_save: !prev.already_registered,
+              message: 'Terhubung & Aplikasi Nusuk Terdeteksi.',
+            }
+          : prev
+      );
+      toast?.({
+        type: 'success',
+        title: 'Auto-Install Nusuk',
+        message: 'Aplikasi Nusuk berhasil diinstal di perangkat.',
+      });
+    } catch (e) {
+      setShowInstallConfirm(false);
+      setError(errorDetail(e, 'Gagal menginstal Aplikasi Nusuk'));
+    } finally {
+      setInstallingApp(false);
+    }
+  };
+
   // Tab 1 test
   const portNum = parseInt(port, 10);
   const validTcpAddr = ip.trim() && Number.isInteger(portNum) && portNum > 0 && portNum < 65536;
@@ -334,7 +387,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
         ip: ip.trim(),
         port: portNum,
       });
-      setResult(res.data);
+      handleTestResult(res.data);
     } catch (e) {
       setError(errorDetail(e, 'Cek koneksi gagal'));
     } finally {
@@ -356,7 +409,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
           ? { connection_type: 'usb', adb_serial: dev.adb_serial }
           : { connection_type: 'tcp', ip: dev.ip, port: dev.port, adb_serial: dev.adb_serial };
       const res = await instancesApi.testConnection(payload);
-      setResult(res.data);
+      handleTestResult(res.data);
     } catch (e) {
       setError(errorDetail(e, 'Cek perangkat USB gagal'));
     } finally {
@@ -408,7 +461,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
         ip: pairIp.trim(),
         port: connectPortNum,
       });
-      setResult(res.data);
+      handleTestResult(res.data);
       if (!name.trim() && res.data?.model) {
         setName(res.data.model);
       }
@@ -420,7 +473,11 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
   };
 
   const canSave =
-    result && result.can_save && !saving && (!result.clone_conflict || forceNew);
+    result &&
+    (result.can_save || (result.adb_ok && !result.already_registered && allowSaveWithoutNusuk)) &&
+    !saving &&
+    !installingApp &&
+    (!result.clone_conflict || forceNew);
 
   const save = async () => {
     if (!result) return;
@@ -433,6 +490,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
         ip: result.ip || undefined,
         port: result.port || undefined,
         force_new_uuid: !!(result.clone_conflict && forceNew),
+        ...(bindToUuid ? { bind_to_uuid: bindToUuid } : {}),
       };
       if (name.trim()) body.name = name.trim();
       const res = await instancesApi.create(body);
@@ -459,6 +517,37 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
 
   const input =
     'w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white text-xs focus:outline-none focus:border-sky-500';
+
+  const renderIdentityMigration = (selectId, disabled = false) => (
+    <div className="p-3 rounded-lg bg-slate-900/70 border border-slate-800 space-y-1.5">
+      <div className="text-[11px] font-semibold text-slate-300">
+        Identity Migration (Assign to Old Device)
+      </div>
+      <label
+        htmlFor={selectId}
+        className="block text-[11px] font-medium text-slate-400"
+      >
+        Bind to Existing Identity (Migration)
+      </label>
+      <select
+        id={selectId}
+        value={bindToUuid}
+        onChange={(e) => setBindToUuid(e.target.value)}
+        disabled={disabled || loadingMigrationTargets}
+        className="w-full px-2.5 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
+      >
+        <option value="">Create as Brand New Instance</option>
+        {migrationTargets.map((item) => (
+          <option key={item.uuid} value={item.uuid}>
+            {item.name} - {item.status}{item.isArchived ? ' (Arsip)' : ''}
+          </option>
+        ))}
+      </select>
+      <p className="text-[10px] text-slate-400 leading-relaxed">
+        If selected, this device will inherit the quiz history, limits, and keys of the old device.
+      </p>
+    </div>
+  );
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
@@ -888,34 +977,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                   </div>
 
                   {/* Advanced / Migration Options */}
-                  <div className="p-3 rounded-lg bg-slate-900/70 border border-slate-800 space-y-1.5">
-                    <div className="text-[11px] font-semibold text-slate-300">
-                      Advanced / Migration Options
-                    </div>
-                    <label
-                      htmlFor="redroid-bind-uuid"
-                      className="block text-[11px] font-medium text-slate-400"
-                    >
-                      Bind to Existing Identity (Migration)
-                    </label>
-                    <select
-                      id="redroid-bind-uuid"
-                      value={bindToUuid}
-                      onChange={(e) => setBindToUuid(e.target.value)}
-                      disabled={deployingRedroid || loadingMigrationTargets}
-                      className="w-full px-2.5 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
-                    >
-                      <option value="">Create as Brand New Instance</option>
-                      {migrationTargets.map((item) => (
-                        <option key={item.uuid} value={item.uuid}>
-                          {item.name} - {item.status}{item.isArchived ? ' (Arsip)' : ''}
-                        </option>
-                      ))}
-                    </select>
-                    <p className="text-[10px] text-slate-400 leading-relaxed">
-                      If selected, this Redroid will inherit the quiz history, limits, and keys of the old device.
-                    </p>
-                  </div>
+                  {renderIdentityMigration('redroid-bind-uuid', deployingRedroid)}
 
                   <button
                     type="button"
@@ -1071,6 +1133,8 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
           </div>
         )}
 
+        {tab !== 'redroid' && renderIdentityMigration('device-bind-uuid', saving || installingApp)}
+
         {error && (
           <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-800/60 text-rose-300 text-[11px] break-words">
             {error}
@@ -1127,7 +1191,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                 </label>
               </div>
             )}
-            {!result.can_save && !result.already_registered && (
+            {!result.can_save && !result.already_registered && !allowSaveWithoutNusuk && (
               <Line ok={false}>Instance belum dapat disimpan. Periksa koneksi di atas.</Line>
             )}
           </div>
@@ -1149,6 +1213,63 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
           )}
         </div>
       </div>
+
+      {showInstallConfirm && (
+        <div className="fixed inset-0 z-[60] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="p-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-400 shrink-0">
+                <Download className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h4 className="text-sm font-semibold text-white">Install Aplikasi Nusuk</h4>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Aplikasi Nusuk belum terinstal di perangkat ini. Install sekarang secara otomatis?
+                </p>
+              </div>
+            </div>
+
+            {installingApp && (
+              <div className="p-2.5 rounded-xl bg-sky-950/40 border border-sky-700/50 text-sky-200 text-xs flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-sky-400 shrink-0" />
+                <span>Menginstal Split APK Nusuk ke perangkat via ADB… Mohon tunggu.</span>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 text-xs pt-1">
+              <button
+                type="button"
+                disabled={installingApp}
+                onClick={() => {
+                  setShowInstallConfirm(false);
+                  setAllowSaveWithoutNusuk(true);
+                }}
+                className="px-4 py-2 rounded-xl text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 disabled:opacity-40 transition"
+              >
+                Nanti/Tidak
+              </button>
+              <button
+                type="button"
+                disabled={installingApp}
+                onClick={handleInstallNusukApp}
+                className="px-4 py-2 rounded-xl font-semibold bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50 flex items-center gap-1.5 transition"
+              >
+                {installingApp ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Menginstal…
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-3.5 h-3.5" />
+                    Ya/Install
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {confirmDeleteContainer && (
         <ConfirmModal

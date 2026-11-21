@@ -18,6 +18,13 @@ class InstanceTestRequest(BaseModel):
     adb_serial: Optional[str] = None
 
 
+class InstanceInstallAppRequest(BaseModel):
+    connection_type: str = Field(default="tcp", description="'tcp' | 'usb' | 'wireless'")
+    ip: Optional[str] = None
+    port: Optional[int] = Field(default=5555, ge=1, le=65535)
+    adb_serial: Optional[str] = None
+
+
 class InstancePairRequest(BaseModel):
     ip: str = Field(..., min_length=1)
     pairing_port: int = Field(..., ge=1, le=65535)
@@ -31,6 +38,7 @@ class InstanceCreateRequest(BaseModel):
     port: Optional[int] = Field(default=5555, ge=1, le=65535)
     adb_serial: Optional[str] = None
     force_new_uuid: bool = False
+    bind_to_uuid: Optional[str] = None
 
 
 class InstanceUpdateRequest(BaseModel):

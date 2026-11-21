@@ -67,6 +67,7 @@ export const instancesApi = {
         : { connection_type: 'tcp', ip: payloadOrIp, port };
     return api.post('/instances/test-connection', body);
   },
+  installApp: (payload) => api.post('/instances/install-app', payload, { timeout: 200000 }),
   create: (payload) => api.post('/instances', payload),
   update: (uuid, payload) => api.patch(`/instances/${uuid}`, payload),
   remove: (uuid) => api.delete(`/instances/${uuid}`),

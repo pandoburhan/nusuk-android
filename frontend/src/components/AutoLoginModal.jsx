@@ -294,7 +294,7 @@ export default function AutoLoginModal({ inst, onClose, toast }) {
                 </p>
               </div>
 
-              <div className="flex items-center justify-center gap-3 pt-1">
+              <div className="flex justify-center gap-2 md:gap-4 overflow-hidden w-full max-w-sm mx-auto pt-1">
                 {otpDigits.map((digit, idx) => (
                   <input
                     key={idx}
@@ -306,7 +306,7 @@ export default function AutoLoginModal({ inst, onClose, toast }) {
                     value={digit}
                     onChange={(e) => handleOtpChange(idx, e.target.value)}
                     onKeyDown={(e) => handleOtpKeyDown(idx, e)}
-                    className="w-13 h-14 text-center text-2xl font-bold font-mono rounded-xl bg-slate-950 border border-slate-700 focus:border-amber-400 focus:ring-2 focus:ring-amber-400/20 text-white focus:outline-none transition"
+                    className="w-12 h-14 md:w-16 md:h-16 text-2xl md:text-3xl font-bold font-mono text-white text-center rounded-lg border border-slate-600 bg-slate-800 focus:ring-2 focus:ring-emerald-500 focus:outline-none transition"
                     aria-label={`Digit OTP ${idx + 1}`}
                   />
                 ))}
