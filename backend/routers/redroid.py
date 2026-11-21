@@ -54,7 +54,7 @@ async def _bg_deploy_and_provision(
     android_version: Optional[str] = None,
 ) -> None:
     ver_label = (
-        "Android 9 (Magisk)"
+        "Android 9"
         if "9.0.0" in (android_version or "")
         else ("Android 11 (Magisk)" if "magisk" in (android_version or "").lower() else "Android 11")
     )

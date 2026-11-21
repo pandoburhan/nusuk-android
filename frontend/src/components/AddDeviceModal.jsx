@@ -839,7 +839,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     className="w-full px-2.5 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
                   >
                     <option value="a11_magisk_ndk_amd">Android 11 (Magisk + NDK)</option>
-                    <option value="redroid/redroid:9.0.0_magisk">Android 9 (Magisk - Local Build)</option>
+                    <option value="redroid/redroid:9.0.0-latest">Android 9</option>
                   </select>
                 </div>
 
