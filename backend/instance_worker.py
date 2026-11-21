@@ -363,22 +363,21 @@ class InstanceWorker:
                 logger.error(f"Error rolling back claim: {e}")
 
     def _spoof_adb_status(self):
-        """Hide ADB & Developer Mode flags in Settings.Global before launching Nusuk."""
+        """Hide Developer Mode flag in Settings.Global before launching Nusuk without killing adbd."""
         if not self.d:
             return
         try:
             self.log_system(
                 LogSeverity.INFO,
                 "ANTI_DETECTION",
-                "Melakukan spoofing status ADB & Developer Mode",
+                "Menyembunyikan status Developer Mode (tanpa mematikan ADB)",
             )
-            self.d.shell("settings put global adb_enabled 0")
             self.d.shell("settings put global development_settings_enabled 0")
         except Exception as e:
             self.log_system(
                 LogSeverity.WARNING,
                 "ANTI_DETECTION",
-                f"Gagal melakukan spoofing status ADB & Developer Mode: {e}",
+                f"Gagal menyembunyikan status Developer Mode (tanpa mematikan ADB): {e}",
             )
 
     def _return_to_homepage(self):

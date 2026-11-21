@@ -646,5 +646,29 @@ class RedroidManager:
             except Exception:
                 pass
 
+    def auto_start_containers(self) -> None:
+        """Auto-start any stopped nusuk_redroid_* Docker containers on backend startup."""
+        client, _ = self._try_get_client()
+        if client is None:
+            return
+        try:
+            containers = client.containers.list(all=True)
+            for container in containers:
+                cname = (container.name or "").lstrip("/")
+                status = (container.status or "").lower()
+                if cname.startswith(CONTAINER_PREFIX) and status != "running":
+                    try:
+                        logger.info(f"Auto-starting Redroid container: {cname}")
+                        container.start()
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-start Redroid container '{cname}': {e}")
+        except Exception as e:
+            logger.warning(f"Error listing Redroid containers for auto-start: {e}")
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
 
 redroid_manager = RedroidManager()

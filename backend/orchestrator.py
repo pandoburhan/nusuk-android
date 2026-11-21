@@ -11,6 +11,7 @@ from backend.adb_manager import adb_manager
 from backend.event_log import log_event
 from backend.instance_manager import instance_manager
 from backend.instance_worker import InstanceWorker
+from backend.redroid_manager import redroid_manager
 from backend import key_service
 
 logger = logging.getLogger(__name__)
@@ -407,6 +408,7 @@ class Orchestrator:
             instance_manager.soft_delete(device_uuid)
 
     def startup(self):
+        redroid_manager.auto_start_containers()
         n = key_service.sweep_orphan_claims()
         if n:
             log_event(LogSeverity.WARNING, "KEY_LIFECYCLE",
