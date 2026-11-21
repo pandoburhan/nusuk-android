@@ -2,9 +2,10 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   X, CheckCircle2, XCircle, AlertTriangle, Loader2, Plug, Save, Info,
   Monitor, Usb, Wifi, RefreshCw, Link2, Smartphone, Box, Download, Rocket, Trash2,
+  Play, Square,
 } from 'lucide-react';
 import { instancesApi, redroidApi, errorDetail } from '../api/client';
-import { ConnectionBadge } from './common';
+import { ConnectionBadge, ConfirmModal } from './common';
 
 const Line = ({ ok, warn, children }) => (
   <div className="flex items-start gap-2 text-[11px]">
@@ -62,7 +63,11 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
   const [pullingImage, setPullingImage] = useState(false);
   const [pullProgressMsg, setPullProgressMsg] = useState('');
   const [deployingRedroid, setDeployingRedroid] = useState(false);
-  const [destroyingId, setDestroyingId] = useState(null);
+  const [deployProgress, setDeployProgress] = useState(null); // { status: 'progress'|'ready'|'error', message }
+  const [containers, setContainers] = useState([]);
+  const [loadingContainers, setLoadingContainers] = useState(false);
+  const [containerActionId, setContainerActionId] = useState(null);
+  const [confirmDeleteContainer, setConfirmDeleteContainer] = useState(null);
   const [bindToUuid, setBindToUuid] = useState('');
   const [migrationTargets, setMigrationTargets] = useState([]);
   const [loadingMigrationTargets, setLoadingMigrationTargets] = useState(false);
@@ -92,6 +97,19 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
     }
   }, []);
 
+  // Load Redroid containers list (running & exited)
+  const loadRedroidContainers = useCallback(async (silent = false) => {
+    if (!silent) setLoadingContainers(true);
+    try {
+      const res = await redroidApi.listContainers();
+      setContainers(res.data?.items || []);
+    } catch {
+      if (!silent) setContainers([]);
+    } finally {
+      if (!silent) setLoadingContainers(false);
+    }
+  }, []);
+
   // Load Redroid / Docker status
   const loadRedroidStatus = useCallback(async () => {
     setRedroidLoading(true);
@@ -102,6 +120,9 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
       setRedroidStatus(d);
       setPullingImage(Boolean(d?.pulling_image));
       if (d?.pull_status) setPullProgressMsg(d.pull_status);
+      if (Array.isArray(d?.containers)) {
+        setContainers(d.containers);
+      }
     } catch (e) {
       setRedroidStatus(null);
       setError(errorDetail(e, 'Gagal memeriksa status Redroid / Docker'));
@@ -143,11 +164,23 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
       scanDevices();
     } else if (tab === 'redroid') {
       loadRedroidStatus();
+      loadRedroidContainers();
       loadMigrationTargets();
     }
-  }, [tab, scanDevices, loadRedroidStatus, loadMigrationTargets]);
+  }, [tab, scanDevices, loadRedroidStatus, loadRedroidContainers, loadMigrationTargets]);
 
-  // Listen to WebSocket Redroid pull progress while modal is open
+  // Auto-poll container management table every 5s while Redroid tab is open
+  useEffect(() => {
+    if (tab !== 'redroid' || !redroidStatus?.supported || !redroidStatus?.docker_available) {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      loadRedroidContainers(true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [tab, redroidStatus?.supported, redroidStatus?.docker_available, loadRedroidContainers]);
+
+  // Listen to WebSocket Redroid pull & deploy/provisioning progress while modal is open
   useEffect(() => {
     if (!lastRedroidEvent || tab !== 'redroid') return;
     if (lastRedroidEvent.stage === 'pull_image') {
@@ -158,10 +191,27 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
       } else {
         setPullingImage(true);
       }
-    } else if (lastRedroidEvent.status === 'ready') {
-      loadRedroidStatus();
+      return;
     }
-  }, [lastRedroidEvent, tab, loadRedroidStatus]);
+
+    const st = lastRedroidEvent.status;
+    const stage = lastRedroidEvent.stage;
+    const msg = lastRedroidEvent.message || 'Processing Redroid deployment...';
+
+    if (st === 'ready' || stage === 'ready') {
+      setDeployProgress({ status: 'ready', message: msg });
+      setDeployingRedroid(false);
+      loadRedroidContainers(true);
+      loadMigrationTargets();
+      refreshInstances?.();
+    } else if (st === 'error' || stage === 'error') {
+      setDeployProgress({ status: 'error', message: msg });
+      setDeployingRedroid(false);
+      loadRedroidContainers(true);
+    } else {
+      setDeployProgress({ status: 'progress', message: msg });
+    }
+  }, [lastRedroidEvent, tab, loadRedroidStatus, loadRedroidContainers, loadMigrationTargets, refreshInstances]);
 
   const handleInstallRedroidImage = async () => {
     setPullingImage(true);
@@ -188,6 +238,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
 
   const handleDeployRedroid = async () => {
     setDeployingRedroid(true);
+    setDeployProgress({ status: 'progress', message: 'Creating container...' });
     setError('');
     try {
       const payload = {
@@ -196,34 +247,74 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
       };
       await redroidApi.deployInstance(payload);
       toast?.({
-        type: 'success',
+        type: 'info',
         title: 'Redroid Deploy',
-        message: 'Deploying new instance in the background. It will appear on the dashboard soon.',
+        message: 'Deploying new instance in the background...',
       });
-      onClose();
     } catch (e) {
-      setError(errorDetail(e, 'Gagal men-deploy instance Redroid'));
-    } finally {
+      const msg = errorDetail(e, 'Gagal men-deploy instance Redroid');
       setDeployingRedroid(false);
+      setDeployProgress({ status: 'error', message: msg });
+      setError(msg);
     }
   };
 
-  const handleDestroyRedroid = async (containerId, containerName) => {
-    setDestroyingId(containerId);
+  const handleStartContainer = async (containerId, containerName) => {
+    setContainerActionId(containerId);
+    setError('');
+    try {
+      await redroidApi.startContainer(containerId);
+      toast?.({
+        type: 'success',
+        title: 'Redroid Start',
+        message: `Container ${containerName} berhasil dijalankan.`,
+      });
+      await loadRedroidContainers(true);
+    } catch (e) {
+      setError(errorDetail(e, `Gagal menjalankan container ${containerName}`));
+    } finally {
+      setContainerActionId(null);
+    }
+  };
+
+  const handleStopContainer = async (containerId, containerName) => {
+    setContainerActionId(containerId);
+    setError('');
+    try {
+      await redroidApi.stopContainer(containerId);
+      toast?.({
+        type: 'info',
+        title: 'Redroid Stop',
+        message: `Container ${containerName} dihentikan.`,
+      });
+      await loadRedroidContainers(true);
+    } catch (e) {
+      setError(errorDetail(e, `Gagal menghentikan container ${containerName}`));
+    } finally {
+      setContainerActionId(null);
+    }
+  };
+
+  const handleConfirmDestroyContainer = async () => {
+    if (!confirmDeleteContainer) return;
+    const { container_id: containerId, name: cname, container_name: altName } = confirmDeleteContainer;
+    const label = cname || altName || containerId;
+    setConfirmDeleteContainer(null);
+    setContainerActionId(containerId);
     setError('');
     try {
       await redroidApi.destroyInstance(containerId);
       toast?.({
         type: 'success',
-        title: 'Redroid',
-        message: `Container ${containerName} berhasil dihentikan & dihapus.`,
+        title: 'Redroid Deleted',
+        message: `Container ${label} dihapus & instance terkait di-soft-delete dari dashboard.`,
       });
       refreshInstances?.();
-      await loadRedroidStatus();
+      await Promise.all([loadRedroidContainers(true), loadMigrationTargets()]);
     } catch (e) {
-      setError(errorDetail(e, 'Gagal menghapus container Redroid'));
+      setError(errorDetail(e, `Gagal menghapus container ${label}`));
     } finally {
-      setDestroyingId(null);
+      setContainerActionId(null);
     }
   };
 
@@ -806,7 +897,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     type="button"
                     onClick={handleDeployRedroid}
                     disabled={deployingRedroid}
-                    className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/25 transition active:scale-[0.99]"
+                    className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/25 transition active:scale-[0.99]"
                   >
                     {deployingRedroid ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -816,48 +907,137 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     {deployingRedroid ? 'Deploying…' : 'Deploy New Instance (Android 9)'}
                   </button>
 
+                  {deployProgress && (
+                    <div
+                      className={`p-2.5 rounded-lg border text-[11px] flex items-center gap-2 ${
+                        deployProgress.status === 'ready'
+                          ? 'bg-emerald-950/40 border-emerald-700/60 text-emerald-200'
+                          : deployProgress.status === 'error'
+                            ? 'bg-rose-950/40 border-rose-700/60 text-rose-200'
+                            : 'bg-indigo-950/40 border-indigo-700/50 text-indigo-200'
+                      }`}
+                    >
+                      {deployProgress.status === 'ready' ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      ) : deployProgress.status === 'error' ? (
+                        <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                      ) : (
+                        <Loader2 className="w-4 h-4 animate-spin text-indigo-400 shrink-0" />
+                      )}
+                      <span className="break-words">{deployProgress.message}</span>
+                    </div>
+                  )}
+
                   <p className="text-[10px] text-slate-400 text-center font-mono">
-                    Default spec: 720x1280, 320DPI, 1 CPU, 1536MB RAM
+                    Default spec: 720x1280, 320DPI, 1 CPU, 1536MB RAM (Guest GPU)
                   </p>
                 </div>
 
-                {/* Running Redroid Containers */}
-                {Array.isArray(redroidStatus.containers) && redroidStatus.containers.length > 0 && (
-                  <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
-                    <div className="text-[11px] font-semibold text-slate-300 flex items-center justify-between">
-                      <span>Active Redroid Containers ({redroidStatus.containers.length})</span>
-                    </div>
-                    <div className="space-y-1.5 max-h-36 overflow-y-auto pr-0.5">
-                      {redroidStatus.containers.map((c) => (
-                        <div
-                          key={c.container_id}
-                          className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px]"
-                        >
-                          <div className="min-w-0">
-                            <div className="font-mono text-slate-200 truncate">{c.container_name}</div>
-                            <div className="text-[10px] text-slate-500 font-mono">
-                              {c.adb_serial || `port ${c.adb_port ?? '?'}`} · {c.status}
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            disabled={destroyingId === c.container_id}
-                            onClick={() => handleDestroyRedroid(c.container_id, c.container_name)}
-                            className="px-2 py-1 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 text-[10px] font-medium flex items-center gap-1 disabled:opacity-40 shrink-0"
-                            title="Hentikan container & soft-delete instance"
-                          >
-                            {destroyingId === c.container_id ? (
-                              <Loader2 className="w-3 h-3 animate-spin" />
-                            ) : (
-                              <Trash2 className="w-3 h-3" />
-                            )}
-                            Destroy
-                          </button>
-                        </div>
-                      ))}
-                    </div>
+                {/* Redroid Management Table */}
+                <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold text-slate-200">
+                      Redroid Management Table ({containers.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => loadRedroidContainers(false)}
+                      disabled={loadingContainers}
+                      className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[10px] font-medium flex items-center gap-1 disabled:opacity-40"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${loadingContainers ? 'animate-spin' : ''}`} />
+                      Refresh
+                    </button>
                   </div>
-                )}
+
+                  {loadingContainers && containers.length === 0 ? (
+                    <div className="py-4 text-center text-slate-500 text-[11px] flex items-center justify-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
+                      Memuat daftar container…
+                    </div>
+                  ) : containers.length === 0 ? (
+                    <div className="py-4 text-center text-slate-500 text-[11px]">
+                      Belum ada container Redroid (<span className="font-mono">nusuk_redroid_*</span>).
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto max-h-48 overflow-y-auto rounded-lg border border-slate-800">
+                      <table className="w-full text-left text-[11px]">
+                        <thead className="bg-slate-900/90 text-slate-400 uppercase text-[10px] border-b border-slate-800">
+                          <tr>
+                            <th className="px-2.5 py-2 font-semibold">Container Name</th>
+                            <th className="px-2 py-2 font-semibold">Status</th>
+                            <th className="px-2 py-2 font-semibold">ADB Port</th>
+                            <th className="px-2.5 py-2 font-semibold text-right">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
+                          {containers.map((c) => {
+                            const cname = c.name || c.container_name;
+                            const isRunning = String(c.status).toLowerCase() === 'running';
+                            const isBusy = containerActionId === c.container_id;
+                            return (
+                              <tr key={c.container_id} className="hover:bg-slate-900/50">
+                                <td className="px-2.5 py-2 font-mono text-slate-200 truncate max-w-[150px]" title={cname}>
+                                  {cname}
+                                </td>
+                                <td className="px-2 py-2">
+                                  <span
+                                    className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase border ${
+                                      isRunning
+                                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                                        : 'bg-slate-800 text-slate-400 border-slate-700'
+                                    }`}
+                                  >
+                                    {c.status}
+                                  </span>
+                                </td>
+                                <td className="px-2 py-2 font-mono text-slate-300">
+                                  {c.adb_port ?? '—'}
+                                </td>
+                                <td className="px-2.5 py-2 text-right">
+                                  <div className="inline-flex items-center gap-1">
+                                    {!isRunning ? (
+                                      <button
+                                        type="button"
+                                        disabled={isBusy}
+                                        onClick={() => handleStartContainer(c.container_id, cname)}
+                                        className="px-2 py-1 rounded bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 text-[10px] font-medium inline-flex items-center gap-1 disabled:opacity-40"
+                                        title="Start container"
+                                      >
+                                        {isBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                                        Start
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        disabled={isBusy}
+                                        onClick={() => handleStopContainer(c.container_id, cname)}
+                                        className="px-2 py-1 rounded bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/40 text-[10px] font-medium inline-flex items-center gap-1 disabled:opacity-40"
+                                        title="Stop container"
+                                      >
+                                        {isBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
+                                        Stop
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      disabled={isBusy}
+                                      onClick={() => setConfirmDeleteContainer(c)}
+                                      className="p-1 rounded bg-rose-600/20 hover:bg-rose-600/30 text-rose-400 border border-rose-500/40 disabled:opacity-40"
+                                      title="Hapus container & soft-delete instance"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -941,6 +1121,21 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
           )}
         </div>
       </div>
+
+      {confirmDeleteContainer && (
+        <ConfirmModal
+          title={`Hapus Container Redroid — ${confirmDeleteContainer.name || confirmDeleteContainer.container_name}`}
+          danger
+          confirmLabel="Ya, Hapus Container"
+          onCancel={() => setConfirmDeleteContainer(null)}
+          onConfirm={handleConfirmDestroyContainer}
+        >
+          <p>
+            Container Docker <span className="font-mono text-white">{confirmDeleteContainer.name || confirmDeleteContainer.container_name}</span> akan
+            dihentikan &amp; dihapus permanen, serta instance terkait di database MySQL akan di-<strong>soft-delete</strong>.
+          </p>
+        </ConfirmModal>
+      )}
     </div>
   );
 }

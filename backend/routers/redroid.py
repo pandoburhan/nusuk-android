@@ -175,6 +175,11 @@ async def deploy_redroid(payload: Optional[RedroidDeployRequest] = Body(default=
             detail=f"Image '{REDROID_IMAGE}' belum terpasang. Klik 'Install Redroid Image' terlebih dahulu.",
         )
 
+    try:
+        redroid_manager.ensure_binder_support()
+    except RedroidNotSupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     req_name = payload.name if payload else None
     req_port = payload.adb_port if payload else None
     req_bind_uuid = (payload.bind_to_uuid or "").strip() or None if payload else None
@@ -204,6 +209,68 @@ async def deploy_redroid(payload: Optional[RedroidDeployRequest] = Body(default=
         success=True,
         message="Deploying new instance in the background. It will appear on the dashboard soon.",
         data={"queued": True, "name": req_name, "bind_to_uuid": req_bind_uuid},
+    )
+
+
+@router.get("/containers")
+async def list_redroid_containers():
+    """Return all Redroid containers (`nusuk_redroid_*`, both running and exited)."""
+    items = await asyncio.to_thread(redroid_manager.list_redroid_instances, True)
+    return {"items": items}
+
+
+@router.post("/{container_id}/start", response_model=ActionResponse)
+async def start_redroid_container(container_id: str):
+    """Starts an exited Redroid container (`docker start`)."""
+    try:
+        info = await asyncio.to_thread(redroid_manager.start_redroid_instance, container_id)
+    except RedroidNotSupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start container: {e}")
+
+    log_event(
+        LogSeverity.INFO,
+        "REDROID",
+        f"Container Redroid '{info.get('container_name')}' dijalankan (status: {info.get('status')}).",
+    )
+    return ActionResponse(
+        success=True,
+        message=f"Container '{info.get('container_name')}' berhasil dijalankan.",
+        data=info,
+    )
+
+
+@router.post("/{container_id}/stop", response_model=ActionResponse)
+async def stop_redroid_container(container_id: str):
+    """Stops a running Redroid container (`docker stop`)."""
+    try:
+        info = await asyncio.to_thread(redroid_manager.stop_redroid_instance, container_id)
+    except RedroidNotSupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to stop container: {e}")
+
+    adb_port = info.get("adb_port")
+    if adb_port:
+        try:
+            await asyncio.to_thread(adb_manager.disconnect, f"127.0.0.1:{adb_port}")
+        except Exception:
+            pass
+
+    log_event(
+        LogSeverity.INFO,
+        "REDROID",
+        f"Container Redroid '{info.get('container_name')}' dihentikan (status: {info.get('status')}).",
+    )
+    return ActionResponse(
+        success=True,
+        message=f"Container '{info.get('container_name')}' berhasil dihentikan.",
+        data=info,
     )
 
 

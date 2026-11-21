@@ -154,8 +154,11 @@ export const settingsApi = {
 
 export const redroidApi = {
   getStatus: () => api.get('/redroid/status'),
+  listContainers: () => api.get('/redroid/containers'),
   installImage: () => api.post('/redroid/install-image'),
   deployInstance: (payload = {}) => api.post('/redroid/deploy', payload),
+  startContainer: (containerId) => api.post(`/redroid/${encodeURIComponent(containerId)}/start`),
+  stopContainer: (containerId) => api.post(`/redroid/${encodeURIComponent(containerId)}/stop`),
   destroyInstance: (containerId) => api.delete(`/redroid/destroy/${encodeURIComponent(containerId)}`),
 };
 

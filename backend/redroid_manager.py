@@ -43,6 +43,7 @@ REDROID_BOOT_ARGS = [
     "androidboot.redroid_height=1280",
     "androidboot.redroid_dpi=320",
     "androidboot.redroid_fps=30",
+    "androidboot.redroid_gpu.mode=guest",
     "redroid.memory.size=1536M",
     "ro.product.cpu.abilist=x86_64,arm64-v8a",
 ]
@@ -63,6 +64,18 @@ class RedroidManager:
     @staticmethod
     def is_linux() -> bool:
         return sys.platform.startswith("linux")
+
+    @staticmethod
+    def check_binder_support() -> bool:
+        """Pre-flight check for Linux kernel Binder support (/dev/binderfs or /dev/binder)."""
+        return os.path.exists("/dev/binderfs") or os.path.exists("/dev/binder")
+
+    def ensure_binder_support(self) -> None:
+        if self.is_linux() and not self.check_binder_support():
+            raise RedroidNotSupportedError(
+                "Kernel module Binder tidak terdeteksi di Host OS Ubuntu. "
+                "OS tidak mendukung Redroid. Harap install linux-modules-extra."
+            )
 
     @property
     def is_pulling_image(self) -> bool:
@@ -354,8 +367,10 @@ class RedroidManager:
           -p <adb_port>:5555 --name <container_name> redroid/redroid:9.0.0-latest
           androidboot.redroid_width=720 androidboot.redroid_height=1280
           androidboot.redroid_dpi=320 androidboot.redroid_fps=30
+          androidboot.redroid_gpu.mode=guest
           redroid.memory.size=1536M ro.product.cpu.abilist=x86_64,arm64-v8a
         """
+        self.ensure_binder_support()
         client = self._get_client()
         try:
             generated_uuid = str(uuid.uuid4())
@@ -457,20 +472,21 @@ class RedroidManager:
                         data_dir = m["Source"]
                         break
 
-            logger.info(f"Stopping Redroid container '{cname}' ({cid[:12]})...")
+            logger.info(f"Stopping & removing Redroid container '{cname}' ({cid[:12]})...")
             try:
                 container.stop(timeout=10)
             except NotFound:
                 pass
+            except Exception as e:
+                logger.debug(f"Container stop warning for '{cname}': {e}")
 
-            # Safety fallback if container was created without auto_remove
+            # Force remove container (handles both --rm and non-rm or stuck containers)
             try:
-                container.reload()
                 container.remove(force=True)
             except NotFound:
                 pass
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Container force-remove warning for '{cname}': {e}")
 
             if adb_port:
                 with self._port_lock:
@@ -516,27 +532,29 @@ class RedroidManager:
             return int(lbl_port)
         return None
 
-    def _list_containers_with_client(self, client) -> List[Dict[str, Any]]:
+    def _list_containers_with_client(self, client, include_stopped: bool = True) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         try:
-            containers = client.containers.list(filters={"name": CONTAINER_PREFIX})
+            containers = client.containers.list(all=include_stopped, filters={"name": CONTAINER_PREFIX})
         except Exception as e:
             logger.warning(f"Error listing Redroid containers: {e}")
             return results
 
         for c in containers:
             try:
-                cname = c.name or ""
+                cname = (c.name or "").lstrip("/")
                 if not cname.startswith(CONTAINER_PREFIX):
                     continue
                 attrs = c.attrs or {}
                 labels = (attrs.get("Config") or {}).get("Labels") or {}
                 adb_port = self._extract_host_port(attrs, labels)
+                c_status = (c.status or "unknown").lower()
                 results.append({
                     "container_id": c.id,
                     "short_id": c.short_id,
+                    "name": cname,
                     "container_name": cname,
-                    "status": c.status,
+                    "status": c_status,
                     "adb_port": adb_port,
                     "adb_serial": f"127.0.0.1:{adb_port}" if adb_port else None,
                     "device_uuid": labels.get("nusuk.device_uuid"),
@@ -546,13 +564,82 @@ class RedroidManager:
                 continue
         return results
 
-    def list_redroid_instances(self) -> List[Dict[str, Any]]:
-        """Returns list of running `nusuk_redroid_*` containers with port mappings."""
+    def list_redroid_instances(self, include_stopped: bool = True) -> List[Dict[str, Any]]:
+        """Returns list of all `nusuk_redroid_*` containers (running & exited) with port mappings."""
         client, _ = self._try_get_client()
         if client is None:
             return []
         try:
-            return self._list_containers_with_client(client)
+            return self._list_containers_with_client(client, include_stopped=include_stopped)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def start_redroid_instance(self, container_id_or_name: str) -> Dict[str, Any]:
+        """Starts an exited Redroid container."""
+        client = self._get_client()
+        try:
+            try:
+                container = client.containers.get(container_id_or_name)
+            except NotFound:
+                raise LookupError(f"Redroid container '{container_id_or_name}' not found.")
+
+            cname = (container.name or "").lstrip("/")
+            if (container.status or "").lower() != "running":
+                container.start()
+                container.reload()
+
+            attrs = container.attrs or {}
+            labels = (attrs.get("Config") or {}).get("Labels") or {}
+            adb_port = self._extract_host_port(attrs, labels)
+            return {
+                "container_id": container.id,
+                "name": cname,
+                "container_name": cname,
+                "status": (container.status or "running").lower(),
+                "adb_port": adb_port,
+                "adb_serial": f"127.0.0.1:{adb_port}" if adb_port else None,
+            }
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def stop_redroid_instance(self, container_id_or_name: str) -> Dict[str, Any]:
+        """Stops a running Redroid container."""
+        client = self._get_client()
+        try:
+            try:
+                container = client.containers.get(container_id_or_name)
+            except NotFound:
+                raise LookupError(f"Redroid container '{container_id_or_name}' not found.")
+
+            cname = (container.name or "").lstrip("/")
+            attrs = container.attrs or {}
+            labels = (attrs.get("Config") or {}).get("Labels") or {}
+            adb_port = self._extract_host_port(attrs, labels)
+
+            if (container.status or "").lower() == "running":
+                container.stop(timeout=10)
+                try:
+                    container.reload()
+                    new_status = (container.status or "exited").lower()
+                except NotFound:
+                    new_status = "removed"
+            else:
+                new_status = (container.status or "exited").lower()
+
+            return {
+                "container_id": container.id,
+                "name": cname,
+                "container_name": cname,
+                "status": new_status,
+                "adb_port": adb_port,
+                "adb_serial": f"127.0.0.1:{adb_port}" if adb_port else None,
+            }
         finally:
             try:
                 client.close()

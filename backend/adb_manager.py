@@ -333,14 +333,15 @@ class ADBManager:
             telemetry_manager.emit_sync("redroid_provisioning_event", payload)
 
         try:
-            # 1. Wait for ADB connection & Android boot completion
-            emit_progress("waiting_adb", "progress", f"Waiting for ADB on {target}...")
+            # 1. Clear any stale/ghost ADB connection first, then wait for ADB & Android boot completion
+            emit_progress("waiting_adb", "progress", f"Connecting ADB to {target}...")
             log_event(
                 LogSeverity.INFO,
                 "REDROID",
-                f"Auto-provisioning container '{container_name}' ({target}): menunggu ADB siap...",
+                f"Auto-provisioning container '{container_name}' ({target}): membersihkan ghost connection & menunggu ADB siap...",
                 None,
             )
+            self.disconnect(target)
 
             deadline = time.time() + max(30, int(adb_wait_timeout))
             adb_ready = False
