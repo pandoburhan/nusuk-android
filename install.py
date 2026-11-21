@@ -237,40 +237,102 @@ def _command_version(cmd_name: str) -> Optional[str]:
     return None
 
 
+def _parse_semver(ver_str: Optional[str]) -> Optional[Tuple[int, int, int]]:
+    if not ver_str:
+        return None
+    cleaned = ver_str.strip().lstrip("vV")
+    parts = cleaned.split(".")
+    try:
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        patch = int(parts[2].split("-")[0]) if len(parts) > 2 else 0
+        return (major, minor, patch)
+    except ValueError:
+        return None
+
+
+def _is_node_version_supported(ver_str: Optional[str]) -> bool:
+    """Vite 8 / Rolldown requires Node.js ^20.19.0 || >=22.12.0."""
+    parsed = _parse_semver(ver_str)
+    if not parsed:
+        return False
+    major, minor, _ = parsed
+    if major == 20:
+        return minor >= 19
+    if major == 22:
+        return minor >= 12
+    return major >= 23
+
+
+def _install_node22_linux() -> None:
+    """Install Node.js 22 LTS (with bundled npm) from official NodeSource repository on Ubuntu/Debian."""
+    if not shutil.which("apt-get") and not shutil.which("apt"):
+        err("Manajer paket 'apt' tidak ditemukan. Instal Node.js >= 22 LTS secara manual lalu jalankan ulang installer.")
+        sys.exit(1)
+
+    setup_script = Path(tempfile.gettempdir()) / "nodesource_setup_22.sh"
+    try:
+        info("Menyiapkan instalasi Node.js 22 LTS (via NodeSource) agar kompatibel dengan Vite 8...")
+        run_cmd(["sudo", "apt-get", "update"], check=True)
+        run_cmd(["sudo", "apt-get", "install", "-y", "ca-certificates", "curl", "gnupg"], check=True)
+
+        # Remove old Ubuntu distro nodejs/npm first to prevent dpkg file-overwrite conflicts
+        run_cmd(["sudo", "apt-get", "remove", "-y", "nodejs", "npm", "libnode-dev"], capture=True)
+        run_cmd(["sudo", "apt-get", "autoremove", "-y"], capture=True)
+
+        if shutil.which("curl"):
+            run_cmd(
+                ["curl", "-fsSL", "https://deb.nodesource.com/setup_22.x", "-o", str(setup_script)],
+                check=True,
+            )
+        else:
+            urllib.request.urlretrieve("https://deb.nodesource.com/setup_22.x", str(setup_script))
+
+        run_cmd(["sudo", "-E", "bash", str(setup_script)], check=True)
+        run_cmd(["sudo", "apt-get", "install", "-y", "nodejs"], check=True)
+    except subprocess.CalledProcessError as e:
+        err(f"Gagal menginstal Node.js 22 LTS secara otomatis (exit code {e.returncode}).")
+        print("  -> Jalankan manual:")
+        print("     sudo apt-get remove -y nodejs npm && curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs")
+        sys.exit(1)
+    except Exception as e:
+        err(f"Error saat instalasi Node.js 22 LTS: {e}")
+        sys.exit(1)
+    finally:
+        try:
+            if setup_script.exists():
+                setup_script.unlink()
+        except Exception:
+            pass
+
+
 def check_and_install_node() -> None:
     node_ver = _command_version("node")
     npm_ver = _command_version("npm.cmd" if IS_WINDOWS else "npm")
 
-    if node_ver and npm_ver:
-        ok(f"Node.js ({node_ver}) dan npm ({npm_ver}) sudah terpasang.")
+    if node_ver and npm_ver and _is_node_version_supported(node_ver):
+        ok(f"Node.js ({node_ver}) dan npm ({npm_ver}) sudah terpasang & kompatibel.")
         return
 
-    warn("Node.js dan/atau npm belum terpasang.")
-    if IS_LINUX:
-        if not shutil.which("apt-get") and not shutil.which("apt"):
-            err("Manajer paket 'apt' tidak ditemukan. Instal Node.js & npm secara manual lalu jalankan ulang installer.")
-            sys.exit(1)
-        info("Mencoba instalasi otomatis Node.js dan npm via apt...")
-        try:
-            run_cmd(["sudo", "apt-get", "update"], check=True)
-            run_cmd(["sudo", "apt-get", "install", "-y", "nodejs", "npm"], check=True)
-        except subprocess.CalledProcessError as e:
-            err(f"Gagal menginstal Node.js/npm secara otomatis (exit code {e.returncode}).")
-            print("  -> Coba jalankan manual: sudo apt update && sudo apt install -y nodejs npm")
-            sys.exit(1)
-        except Exception as e:
-            err(f"Error saat instalasi Node.js/npm: {e}")
-            sys.exit(1)
+    if node_ver and not _is_node_version_supported(node_ver):
+        warn(
+            f"Node.js terdeteksi versi {node_ver}, terlalu lama untuk Vite 8 "
+            "(memerlukan Node.js ^20.19.0 atau >= 22.12.0)."
+        )
+    else:
+        warn("Node.js dan/atau npm belum terpasang.")
 
+    if IS_LINUX:
+        _install_node22_linux()
         node_ver = _command_version("node")
         npm_ver = _command_version("npm")
-        if not (node_ver and npm_ver):
-            err("Node.js/npm masih belum terdeteksi setelah instalasi.")
+        if not (node_ver and npm_ver and _is_node_version_supported(node_ver)):
+            err(f"Node.js ({node_ver}) / npm ({npm_ver}) masih belum memenuhi syarat setelah instalasi.")
             sys.exit(1)
         ok(f"Node.js ({node_ver}) dan npm ({npm_ver}) berhasil diinstal.")
     else:
-        err("Node.js dan npm diperlukan untuk mem-build dashboard React frontend.")
-        print("  -> Silakan unduh dan instal Node.js LTS dari: https://nodejs.org/en/download")
+        err("Node.js >= 20.19.0 (disarankan Node.js 22 LTS) dan npm diperlukan untuk mem-build dashboard React.")
+        print("  -> Silakan unduh dan instal Node.js LTS terbaru dari: https://nodejs.org/en/download")
         print("  -> Setelah instalasi selesai, buka ulang terminal dan jalankan: python install.py")
         sys.exit(1)
 
