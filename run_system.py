@@ -108,6 +108,19 @@ def has_gui_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def resolve_python_executable(root_dir: str) -> str:
+    """Prefer project-local .venv Python if present so users can run `python3 run_system.py` directly."""
+    candidates = (
+        [os.path.join(root_dir, ".venv", "Scripts", "python.exe")]
+        if IS_WINDOWS
+        else [os.path.join(root_dir, ".venv", "bin", "python"), os.path.join(root_dir, ".venv", "bin", "python3")]
+    )
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return sys.executable
+
+
 def terminate_process(proc: subprocess.Popen, name: str) -> None:
     if not proc or proc.poll() is not None:
         return
@@ -165,9 +178,12 @@ def main():
     print(f"[*] Mode Frontend  : {'Vite Dev Server (Port 5173)' if use_vite_dev else 'Native Built SPA via FastAPI (Port ' + str(args.port) + ')'}")
 
     # 4. Start Backend FastAPI
+    backend_python = resolve_python_executable(root_dir)
     print(f"[*] Menjalankan Backend FastAPI (Host: {bind_host}, Port: {args.port})...")
+    if backend_python != sys.executable:
+        print(f"[+] Menggunakan Python Virtual Environment: {backend_python}")
     backend_cmd = [
-        sys.executable,
+        backend_python,
         "-m",
         "uvicorn",
         "backend.main:app",

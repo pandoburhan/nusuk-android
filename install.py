@@ -611,17 +611,68 @@ def ensure_root_requirements() -> Path:
     return REQUIREMENTS_FILE
 
 
+def _ensure_linux_venv() -> Optional[Path]:
+    """Create/reuse a dedicated .venv on Linux to avoid Debian/Ubuntu apt-package conflicts (PEP 668 / RECORD errors)."""
+    venv_dir = ROOT_DIR / ".venv"
+    venv_python = venv_dir / "bin" / "python"
+    if venv_python.exists():
+        # Verify pip works inside existing venv
+        chk = run_cmd([str(venv_python), "-m", "pip", "--version"], capture=True)
+        if chk.returncode == 0:
+            return venv_python
+        shutil.rmtree(venv_dir, ignore_errors=True)
+
+    info(f"Membuat virtual environment terisolasi di {venv_dir} (mencegah konflik paket Debian/Ubuntu)...")
+    res = run_cmd([sys.executable, "-m", "venv", str(venv_dir)], capture=True)
+    if res.returncode != 0:
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        if shutil.which("apt-get"):
+            py_minor = f"python{sys.version_info.major}.{sys.version_info.minor}-venv"
+            warn(f"Modul venv belum terpasang. Menginstal {py_minor} / python3-venv via apt...")
+            run_cmd(["sudo", "apt-get", "update"], capture=True)
+            apt_res = run_cmd(["sudo", "apt-get", "install", "-y", py_minor, "python3-venv"])
+            if apt_res.returncode == 0:
+                res = run_cmd([sys.executable, "-m", "venv", str(venv_dir)], capture=True)
+
+    if res.returncode == 0 and venv_python.exists():
+        ok(f"Virtual environment siap: {venv_dir}")
+        return venv_python
+    return None
+
+
 def install_python_dependencies() -> None:
     req_path = ensure_root_requirements()
-    info(f"Menginstal dependensi Python dari {req_path.name} ...")
-    cmd = [sys.executable, "-m", "pip", "install", "-r", str(req_path)]
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+    target_python = sys.executable
+    if IS_LINUX and not in_venv:
+        venv_py = _ensure_linux_venv()
+        if venv_py:
+            target_python = str(venv_py)
+
+    info(f"Menginstal dependensi Python dari {req_path.name} menggunakan {target_python} ...")
+    cmd = [target_python, "-m", "pip", "install", "-r", str(req_path)]
     res = run_cmd(cmd, cwd=ROOT_DIR)
-    if res.returncode != 0 and IS_LINUX:
-        warn("pip install gagal — mencoba ulang dengan flag --break-system-packages (Ubuntu/Debian PEP 668)...")
+
+    if res.returncode != 0 and IS_LINUX and target_python == sys.executable:
+        warn(
+            "pip install global gagal (PEP 668 / konflik paket Debian seperti idna). "
+            "Mencoba ulang dengan --break-system-packages --ignore-installed..."
+        )
         res = run_cmd(
-            [sys.executable, "-m", "pip", "install", "--break-system-packages", "-r", str(req_path)],
+            [
+                target_python,
+                "-m",
+                "pip",
+                "install",
+                "--break-system-packages",
+                "--ignore-installed",
+                "-r",
+                str(req_path),
+            ],
             cwd=ROOT_DIR,
         )
+
     if res.returncode != 0:
         err("Gagal menginstal dependensi Python. Periksa pesan error di atas.")
         sys.exit(1)
