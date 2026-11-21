@@ -33,8 +33,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ANDROID_VERSION = "11.0.0-latest"
-REDROID_IMAGE = f"redroid/redroid:{DEFAULT_ANDROID_VERSION}"
+DEFAULT_ANDROID_VERSION = "a11_magisk_ndk_amd"
+REDROID_IMAGE_REPO = "abing7k/redroid"
+REDROID_IMAGE = f"{REDROID_IMAGE_REPO}:{DEFAULT_ANDROID_VERSION}"
 CONTAINER_PREFIX = "nusuk_redroid_"
 ADB_PORT_MIN = 5556
 ADB_PORT_MAX = 6000
@@ -47,14 +48,6 @@ REDROID_BOOT_ARGS = [
     "androidboot.redroid_gpu.mode=guest",
     "redroid.memory.size=1536M",
     "ro.product.cpu.abilist=x86_64,arm64-v8a",
-    "ro.product.manufacturer=Samsung",
-    "ro.product.model=SM-G998B",
-    "ro.product.name=p3sxx",
-    "ro.product.device=p3s",
-    "ro.build.tags=release-keys",
-    "ro.build.type=user",
-    "ro.hardware=qcom",
-    "ro.product.board=msmnile",
 ]
 
 
@@ -121,7 +114,9 @@ class RedroidManager:
     @staticmethod
     def resolve_image(android_version: Optional[str] = None) -> str:
         ver = (android_version or DEFAULT_ANDROID_VERSION).strip() or DEFAULT_ANDROID_VERSION
-        return f"redroid/redroid:{ver}"
+        if ":" in ver:
+            return ver
+        return f"{REDROID_IMAGE_REPO}:{ver}"
 
     # ------------------------------------------------------------------ Status & Image
     def check_image_exists(self, client=None, android_version: Optional[str] = None) -> bool:

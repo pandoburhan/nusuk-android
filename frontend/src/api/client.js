@@ -153,7 +153,7 @@ export const settingsApi = {
 };
 
 export const redroidApi = {
-  getStatus: (androidVersion = '11.0.0-latest') =>
+  getStatus: (androidVersion = 'a11_magisk_ndk_amd') =>
     api.get('/redroid/status', { params: { android_version: androidVersion } }),
   listContainers: () => api.get('/redroid/containers'),
   installImage: (payload = {}) => api.post('/redroid/install-image', payload),

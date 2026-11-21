@@ -69,7 +69,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
   const [containerActionId, setContainerActionId] = useState(null);
   const [confirmDeleteContainer, setConfirmDeleteContainer] = useState(null);
   const [bindToUuid, setBindToUuid] = useState('');
-  const [androidVersion, setAndroidVersion] = useState('11.0.0-latest');
+  const [androidVersion, setAndroidVersion] = useState('a11_magisk_ndk_amd');
   const [migrationTargets, setMigrationTargets] = useState([]);
   const [loadingMigrationTargets, setLoadingMigrationTargets] = useState(false);
 
@@ -216,7 +216,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
 
   const handleInstallRedroidImage = async () => {
     setPullingImage(true);
-    setPullProgressMsg(`Memulai unduhan image redroid/redroid:${androidVersion}...`);
+    setPullProgressMsg(`Memulai unduhan image abing7k/redroid:${androidVersion}...`);
     setError('');
     try {
       const res = await redroidApi.installImage({ android_version: androidVersion });
@@ -837,8 +837,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     disabled={pullingImage || deployingRedroid}
                     className="w-full px-2.5 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
                   >
-                    <option value="11.0.0-latest">Android 11</option>
-                    <option value="9.0.0-latest">Android 9</option>
+                    <option value="a11_magisk_ndk_amd">Android 11 (Magisk + NDK)</option>
                   </select>
                 </div>
 
@@ -927,9 +926,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     ) : (
                       <Rocket className="w-4 h-4" />
                     )}
-                    {deployingRedroid
-                      ? 'Deploying…'
-                      : `Deploy New Instance (${androidVersion === '9.0.0-latest' ? 'Android 9' : 'Android 11'})`}
+                    {deployingRedroid ? 'Deploying…' : 'Deploy New Instance (Android 11)'}
                   </button>
 
                   {deployProgress && (
