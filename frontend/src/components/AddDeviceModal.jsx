@@ -216,7 +216,8 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
 
   const handleInstallRedroidImage = async () => {
     setPullingImage(true);
-    setPullProgressMsg(`Memulai unduhan image abing7k/redroid:${androidVersion}...`);
+    const targetImage = androidVersion.includes(':') ? androidVersion : `abing7k/redroid:${androidVersion}`;
+    setPullProgressMsg(`Memulai unduhan image ${targetImage}...`);
     setError('');
     try {
       const res = await redroidApi.installImage({ android_version: androidVersion });
@@ -838,6 +839,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     className="w-full px-2.5 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
                   >
                     <option value="a11_magisk_ndk_amd">Android 11 (Magisk + NDK)</option>
+                    <option value="redroid/redroid:9.0.0_magisk">Android 9 (Magisk - Local Build)</option>
                   </select>
                 </div>
 
@@ -926,7 +928,9 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     ) : (
                       <Rocket className="w-4 h-4" />
                     )}
-                    {deployingRedroid ? 'Deploying…' : 'Deploy New Instance (Android 11)'}
+                    {deployingRedroid
+                      ? 'Deploying…'
+                      : `Deploy New Instance (${androidVersion.includes('9.0.0') ? 'Android 9' : 'Android 11'})`}
                   </button>
 
                   {deployProgress && (

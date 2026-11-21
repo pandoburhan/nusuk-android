@@ -53,7 +53,11 @@ async def _bg_deploy_and_provision(
     bind_to_uuid: Optional[str] = None,
     android_version: Optional[str] = None,
 ) -> None:
-    ver_label = "Android 11 (Magisk)" if "magisk" in (android_version or "").lower() else "Android 11"
+    ver_label = (
+        "Android 9 (Magisk)"
+        if "9.0.0" in (android_version or "")
+        else ("Android 11 (Magisk)" if "magisk" in (android_version or "").lower() else "Android 11")
+    )
     telemetry_manager.emit_sync(
         "redroid_provisioning_event",
         {
