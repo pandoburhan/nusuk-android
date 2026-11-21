@@ -49,6 +49,7 @@ async def _bg_pull_image() -> None:
 async def _bg_deploy_and_provision(
     display_name: Optional[str] = None,
     adb_port: Optional[int] = None,
+    bind_to_uuid: Optional[str] = None,
 ) -> None:
     telemetry_manager.emit_sync(
         "redroid_provisioning_event",
@@ -67,6 +68,7 @@ async def _bg_deploy_and_provision(
             None,
             adb_port,
             display_name,
+            bind_to_uuid,
         )
         log_event(
             LogSeverity.INFO,
@@ -78,7 +80,8 @@ async def _bg_deploy_and_provision(
             container_id=deployed["container_id"],
             container_name=deployed["container_name"],
             device_uuid=deployed["device_uuid"],
-            display_name=deployed["display_name"],
+            display_name=display_name,
+            bind_to_uuid=bind_to_uuid,
         )
     except Exception as e:
         logger.error(f"Background Redroid deploy/provision failed: {e}")
@@ -174,14 +177,33 @@ async def deploy_redroid(payload: Optional[RedroidDeployRequest] = Body(default=
 
     req_name = payload.name if payload else None
     req_port = payload.adb_port if payload else None
+    req_bind_uuid = (payload.bind_to_uuid or "").strip() or None if payload else None
 
-    task = asyncio.create_task(_bg_deploy_and_provision(display_name=req_name, adb_port=req_port))
+    if req_bind_uuid:
+        db = SessionLocal()
+        try:
+            target_inst = db.query(Instance).filter(Instance.uuid == req_bind_uuid).first()
+            if not target_inst:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Target instance UUID '{req_bind_uuid}' tidak ditemukan.",
+                )
+        finally:
+            db.close()
+
+    task = asyncio.create_task(
+        _bg_deploy_and_provision(
+            display_name=req_name,
+            adb_port=req_port,
+            bind_to_uuid=req_bind_uuid,
+        )
+    )
     _track_task(task)
 
     return ActionResponse(
         success=True,
         message="Deploying new instance in the background. It will appear on the dashboard soon.",
-        data={"queued": True, "name": req_name},
+        data={"queued": True, "name": req_name, "bind_to_uuid": req_bind_uuid},
     )
 
 

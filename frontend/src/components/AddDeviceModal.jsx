@@ -63,6 +63,9 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
   const [pullProgressMsg, setPullProgressMsg] = useState('');
   const [deployingRedroid, setDeployingRedroid] = useState(false);
   const [destroyingId, setDestroyingId] = useState(null);
+  const [bindToUuid, setBindToUuid] = useState('');
+  const [migrationTargets, setMigrationTargets] = useState([]);
+  const [loadingMigrationTargets, setLoadingMigrationTargets] = useState(false);
 
   const resetResult = useCallback(() => {
     setResult(null);
@@ -107,13 +110,42 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
     }
   }, []);
 
+  // Load all active + archived instances for Redroid identity migration
+  const loadMigrationTargets = useCallback(async () => {
+    setLoadingMigrationTargets(true);
+    try {
+      const [activeRes, archivedRes] = await Promise.all([
+        instancesApi.list(),
+        instancesApi.archived(),
+      ]);
+      const activeItems = (activeRes.data?.items || []).map((inst) => ({
+        uuid: inst.uuid,
+        name: inst.name || inst.adb_serial || inst.uuid,
+        status: inst.status || 'OFFLINE',
+        isArchived: false,
+      }));
+      const archivedItems = (archivedRes.data?.items || []).map((inst) => ({
+        uuid: inst.uuid,
+        name: inst.name || inst.adb_serial || inst.uuid,
+        status: 'OFFLINE',
+        isArchived: true,
+      }));
+      setMigrationTargets([...activeItems, ...archivedItems]);
+    } catch {
+      setMigrationTargets([]);
+    } finally {
+      setLoadingMigrationTargets(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (tab === 'usb') {
       scanDevices();
     } else if (tab === 'redroid') {
       loadRedroidStatus();
+      loadMigrationTargets();
     }
-  }, [tab, scanDevices, loadRedroidStatus]);
+  }, [tab, scanDevices, loadRedroidStatus, loadMigrationTargets]);
 
   // Listen to WebSocket Redroid pull progress while modal is open
   useEffect(() => {
@@ -158,7 +190,10 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
     setDeployingRedroid(true);
     setError('');
     try {
-      const payload = name.trim() ? { name: name.trim() } : {};
+      const payload = {
+        ...(name.trim() ? { name: name.trim() } : {}),
+        bind_to_uuid: bindToUuid || null,
+      };
       await redroidApi.deployInstance(payload);
       toast?.({
         type: 'success',
@@ -735,6 +770,36 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     <Line>
                       Auto-provisioning: ADB connect otomatis, tanam UUID anchor, dan instal Split APKs Nusuk dari <span className="font-mono">Nusuk_Backup/</span>.
                     </Line>
+                  </div>
+
+                  {/* Advanced / Migration Options */}
+                  <div className="p-3 rounded-lg bg-slate-900/70 border border-slate-800 space-y-1.5">
+                    <div className="text-[11px] font-semibold text-slate-300">
+                      Advanced / Migration Options
+                    </div>
+                    <label
+                      htmlFor="redroid-bind-uuid"
+                      className="block text-[11px] font-medium text-slate-400"
+                    >
+                      Bind to Existing Identity (Migration)
+                    </label>
+                    <select
+                      id="redroid-bind-uuid"
+                      value={bindToUuid}
+                      onChange={(e) => setBindToUuid(e.target.value)}
+                      disabled={deployingRedroid || loadingMigrationTargets}
+                      className="w-full px-2.5 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
+                    >
+                      <option value="">Create as Brand New Instance</option>
+                      {migrationTargets.map((item) => (
+                        <option key={item.uuid} value={item.uuid}>
+                          {item.name} - {item.status}{item.isArchived ? ' (Arsip)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-[10px] text-slate-400 leading-relaxed">
+                      If selected, this Redroid will inherit the quiz history, limits, and keys of the old device.
+                    </p>
                   </div>
 
                   <button

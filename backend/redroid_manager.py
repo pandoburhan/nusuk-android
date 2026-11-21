@@ -346,6 +346,7 @@ class RedroidManager:
         container_name: Optional[str] = None,
         adb_port: Optional[int] = None,
         display_name: Optional[str] = None,
+        bind_to_uuid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Spawns a new privileged Redroid Android 9 container equivalent to:
@@ -357,8 +358,9 @@ class RedroidManager:
         """
         client = self._get_client()
         try:
-            device_uuid = str(uuid.uuid4())
-            uid_short = device_uuid.split("-")[0]
+            generated_uuid = str(uuid.uuid4())
+            device_uuid = (bind_to_uuid or "").strip() or generated_uuid
+            uid_short = generated_uuid.split("-")[0]
 
             if container_name:
                 cname = container_name.strip()

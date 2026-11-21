@@ -118,3 +118,4 @@ class TestAIRequest(BaseModel):
 class RedroidDeployRequest(BaseModel):
     name: Optional[str] = Field(default=None, max_length=64)
     adb_port: Optional[int] = Field(default=None, ge=1024, le=65535)
+    bind_to_uuid: Optional[str] = Field(default=None, max_length=64)

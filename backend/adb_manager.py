@@ -294,14 +294,15 @@ class ADBManager:
         device_uuid: str,
         display_name: Optional[str] = None,
         adb_wait_timeout: int = 120,
+        bind_to_uuid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Post-deployment auto-provisioning worker for a newly launched Redroid container:
           1. Wait until `adb connect 127.0.0.1:<adb_port>` succeeds and Android boot completes.
-          2. Plant anchor file `/sdcard/.nusuk_device_uuid`.
+          2. Plant anchor file `/sdcard/.nusuk_device_uuid` (using `bind_to_uuid` if migrating).
           3. Install Nusuk split APKs from `Nusuk_Backup/`.
-          4. Register new `tcp` instance (`127.0.0.1:<adb_port>`) in MySQL `instances` table
-             and broadcast WebSocket `redroid_provisioning_event` + `device_list_update`.
+          4. Register new `tcp` instance or relink/restore existing `Instance` (`bind_to_uuid`)
+             in MySQL `instances` table and broadcast WebSocket `redroid_provisioning_event` + `device_list_update`.
         """
         from backend.database import SessionLocal
         from backend.models import Instance, LogSeverity
@@ -311,7 +312,10 @@ class ADBManager:
         from backend.instance_manager import instance_manager, Runtime
 
         target = f"127.0.0.1:{int(adb_port)}"
-        inst_name = (display_name or "").strip()[:64] or f"Redroid-{adb_port}"
+        explicit_name = (display_name or "").strip()[:64] or None
+        inst_name = explicit_name or f"Redroid-{adb_port}"
+        target_bind_uuid = (bind_to_uuid or "").strip() or None
+        effective_uuid = target_bind_uuid or device_uuid
 
         def emit_progress(stage: str, status: str, message: str, **extra):
             payload = {
@@ -323,7 +327,7 @@ class ADBManager:
                 "container_name": container_name,
                 "adb_port": int(adb_port),
                 "adb_serial": target,
-                "device_uuid": device_uuid,
+                "device_uuid": effective_uuid,
                 **extra,
             }
             telemetry_manager.emit_sync("redroid_provisioning_event", payload)
@@ -356,15 +360,19 @@ class ADBManager:
                     f"Redroid container '{container_name}' did not become ready via ADB ({target}) within {adb_wait_timeout}s."
                 )
 
-            # 2. Plant anchor file (/sdcard/.nusuk_device_uuid)
+            # 2. Plant anchor file (/sdcard/.nusuk_device_uuid) BEFORE APK install / launch
             emit_progress("planting_anchor", "progress", f"ADB connected ({target}). Planting device identity anchor...")
             anchor_ok = False
             for _ in range(10):
-                if self.write_anchor(target, device_uuid):
+                if self.write_anchor(target, effective_uuid):
                     anchor_ok = True
                     break
                 time.sleep(1.5)
             if not anchor_ok:
+                if target_bind_uuid:
+                    raise RuntimeError(
+                        f"Gagal menulis file anchor UUID ({effective_uuid}) ke {target} sebelum instalasi APK."
+                    )
                 logger.warning(f"Failed to verify anchor on {target}; continuing provisioning.")
 
             # 3. Install Nusuk Split APKs from Nusuk_Backup/
@@ -379,41 +387,78 @@ class ADBManager:
             if not nusuk_installed:
                 raise RuntimeError(f"Instalasi APK selesai tetapi paket {settings.nusuk_package} tidak terdeteksi.")
 
-            # 4. Register instance in MySQL `instances` table
+            # 4. Register or relink instance in MySQL `instances` table
             emit_progress("registering_db", "progress", f"Registering {inst_name} ({target}) in database...")
+            migrated = False
+            restored = False
             db = SessionLocal()
             try:
-                existing = (
-                    db.query(Instance)
-                    .filter(Instance.adb_serial == target, Instance.is_deleted == False)  # noqa: E712
-                    .first()
-                )
-                if existing:
-                    existing.name = inst_name
-                    existing.connection_type = "tcp"
-                    existing.ip = "127.0.0.1"
-                    existing.port = int(adb_port)
-                    existing.nusuk_installed = True
-                    existing.anchor_planted = anchor_ok
-                    existing.last_seen_at = utc_now_naive()
-                    row = existing
-                    device_uuid = row.uuid
-                else:
-                    row = Instance(
-                        uuid=device_uuid,
-                        name=inst_name,
-                        connection_type="tcp",
-                        adb_serial=target,
-                        ip="127.0.0.1",
-                        port=int(adb_port),
-                        live_preview_enabled=True,
-                        nusuk_installed=True,
-                        anchor_planted=anchor_ok,
-                        is_legacy_primary=False,
-                        last_seen_at=utc_now_naive(),
-                        created_at=utc_now_naive(),
+                if target_bind_uuid:
+                    row = db.query(Instance).filter(Instance.uuid == target_bind_uuid).first()
+                    if row is None:
+                        raise LookupError(f"Target instance UUID '{target_bind_uuid}' tidak ditemukan di database.")
+                    conflict = (
+                        db.query(Instance)
+                        .filter(
+                            Instance.adb_serial == target,
+                            Instance.is_deleted == False,  # noqa: E712
+                            Instance.uuid != row.uuid,
+                        )
+                        .first()
                     )
-                    db.add(row)
+                    if conflict:
+                        raise RuntimeError(
+                            f"Alamat ADB {target} sudah dipakai oleh instance aktif lain ({conflict.name})."
+                        )
+                    was_deleted = bool(row.is_deleted)
+                    if was_deleted:
+                        row.is_deleted = False
+                        row.deleted_at = None
+                        restored = True
+                    if explicit_name:
+                        row.name = explicit_name
+                    inst_name = row.name
+                    row.connection_type = "tcp"
+                    row.adb_serial = target
+                    row.ip = "127.0.0.1"
+                    row.port = int(adb_port)
+                    row.nusuk_installed = True
+                    row.anchor_planted = anchor_ok
+                    row.last_seen_at = utc_now_naive()
+                    effective_uuid = row.uuid
+                    migrated = True
+                else:
+                    existing = (
+                        db.query(Instance)
+                        .filter(Instance.adb_serial == target, Instance.is_deleted == False)  # noqa: E712
+                        .first()
+                    )
+                    if existing:
+                        existing.name = inst_name
+                        existing.connection_type = "tcp"
+                        existing.ip = "127.0.0.1"
+                        existing.port = int(adb_port)
+                        existing.nusuk_installed = True
+                        existing.anchor_planted = anchor_ok
+                        existing.last_seen_at = utc_now_naive()
+                        row = existing
+                        effective_uuid = row.uuid
+                    else:
+                        row = Instance(
+                            uuid=effective_uuid,
+                            name=inst_name,
+                            connection_type="tcp",
+                            adb_serial=target,
+                            ip="127.0.0.1",
+                            port=int(adb_port),
+                            live_preview_enabled=True,
+                            nusuk_installed=True,
+                            anchor_planted=anchor_ok,
+                            is_legacy_primary=False,
+                            last_seen_at=utc_now_naive(),
+                            created_at=utc_now_naive(),
+                        )
+                        db.add(row)
                 db.commit()
                 db.refresh(row)
 
@@ -433,27 +478,44 @@ class ADBManager:
             finally:
                 db.close()
 
-            log_event(
-                LogSeverity.INFO,
-                "REDROID",
-                f"Redroid instance '{inst_name}' ({target}) selesai di-provision & siap digunakan.",
-                device_uuid,
-            )
+            if migrated:
+                log_event(
+                    LogSeverity.INFO,
+                    "REDROID",
+                    f"Redroid instance '{inst_name}' ({target}) berhasil di-bind ke identitas {effective_uuid[:8]}"
+                    + (" & dipulihkan dari arsip." if restored else "."),
+                    effective_uuid,
+                )
+            else:
+                log_event(
+                    LogSeverity.INFO,
+                    "REDROID",
+                    f"Redroid instance '{inst_name}' ({target}) selesai di-provision & siap digunakan.",
+                    effective_uuid,
+                )
             instance_manager.emit_device_list()
             emit_progress(
                 "ready",
                 "ready",
-                f"Redroid instance '{inst_name}' ({target}) is Ready!",
+                (
+                    f"Redroid instance '{inst_name}' ({target}) is Ready (migrated)!"
+                    if migrated
+                    else f"Redroid instance '{inst_name}' ({target}) is Ready!"
+                ),
                 instance_name=inst_name,
+                migrated=migrated,
+                restored=restored,
             )
             return {
                 "success": True,
-                "device_uuid": device_uuid,
+                "device_uuid": effective_uuid,
                 "name": inst_name,
                 "adb_serial": target,
                 "adb_port": int(adb_port),
                 "container_id": container_id,
                 "container_name": container_name,
+                "migrated": migrated,
+                "restored": restored,
             }
         except Exception as e:
             logger.exception(f"Redroid provisioning failed for {container_name} ({target}): {e}")
@@ -474,6 +536,7 @@ class ADBManager:
         device_uuid: str,
         display_name: Optional[str] = None,
         adb_wait_timeout: int = 120,
+        bind_to_uuid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Async wrapper executing Redroid auto-provisioning without blocking the FastAPI event loop."""
         return await asyncio.to_thread(
@@ -484,6 +547,7 @@ class ADBManager:
             device_uuid,
             display_name,
             adb_wait_timeout,
+            bind_to_uuid,
         )
 
     # ---------- screenshot (callers MUST check live_preview_enabled first) ----------
