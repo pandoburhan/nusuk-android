@@ -153,9 +153,10 @@ export const settingsApi = {
 };
 
 export const redroidApi = {
-  getStatus: () => api.get('/redroid/status'),
+  getStatus: (androidVersion = '11.0.0-latest') =>
+    api.get('/redroid/status', { params: { android_version: androidVersion } }),
   listContainers: () => api.get('/redroid/containers'),
-  installImage: () => api.post('/redroid/install-image'),
+  installImage: (payload = {}) => api.post('/redroid/install-image', payload),
   deployInstance: (payload = {}) => api.post('/redroid/deploy', payload),
   startContainer: (containerId) => api.post(`/redroid/${encodeURIComponent(containerId)}/start`),
   stopContainer: (containerId) => api.post(`/redroid/${encodeURIComponent(containerId)}/stop`),

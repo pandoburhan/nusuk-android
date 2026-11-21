@@ -115,7 +115,12 @@ class TestAIRequest(BaseModel):
 
 
 # ---- Redroid (Linux Docker) ----
+class RedroidInstallImageRequest(BaseModel):
+    android_version: Optional[str] = Field(default="11.0.0-latest", max_length=64)
+
+
 class RedroidDeployRequest(BaseModel):
     name: Optional[str] = Field(default=None, max_length=64)
     adb_port: Optional[int] = Field(default=None, ge=1024, le=65535)
     bind_to_uuid: Optional[str] = Field(default=None, max_length=64)
+    android_version: Optional[str] = Field(default="11.0.0-latest", max_length=64)

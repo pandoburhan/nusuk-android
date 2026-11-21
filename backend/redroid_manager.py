@@ -33,7 +33,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-REDROID_IMAGE = "redroid/redroid:11.0.0-latest"
+DEFAULT_ANDROID_VERSION = "11.0.0-latest"
+REDROID_IMAGE = f"redroid/redroid:{DEFAULT_ANDROID_VERSION}"
 CONTAINER_PREFIX = "nusuk_redroid_"
 ADB_PORT_MIN = 5556
 ADB_PORT_MAX = 6000
@@ -46,6 +47,14 @@ REDROID_BOOT_ARGS = [
     "androidboot.redroid_gpu.mode=guest",
     "redroid.memory.size=1536M",
     "ro.product.cpu.abilist=x86_64,arm64-v8a",
+    "ro.product.manufacturer=Samsung",
+    "ro.product.model=SM-G998B",
+    "ro.product.name=p3sxx",
+    "ro.product.device=p3s",
+    "ro.build.tags=release-keys",
+    "ro.build.type=user",
+    "ro.hardware=qcom",
+    "ro.product.board=msmnile",
 ]
 
 
@@ -109,8 +118,14 @@ class RedroidManager:
         except Exception as e:
             return None, str(e)
 
+    @staticmethod
+    def resolve_image(android_version: Optional[str] = None) -> str:
+        ver = (android_version or DEFAULT_ANDROID_VERSION).strip() or DEFAULT_ANDROID_VERSION
+        return f"redroid/redroid:{ver}"
+
     # ------------------------------------------------------------------ Status & Image
-    def check_image_exists(self, client=None) -> bool:
+    def check_image_exists(self, client=None, android_version: Optional[str] = None) -> bool:
+        image_name = self.resolve_image(android_version)
         close_after = False
         if client is None:
             client, _ = self._try_get_client()
@@ -118,7 +133,7 @@ class RedroidManager:
                 return False
             close_after = True
         try:
-            client.images.get(REDROID_IMAGE)
+            client.images.get(image_name)
             return True
         except ImageNotFound:
             return False
@@ -132,8 +147,9 @@ class RedroidManager:
                 except Exception:
                     pass
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self, android_version: Optional[str] = None) -> Dict[str, Any]:
         """Returns comprehensive host OS, Docker daemon, image, and container status."""
+        image_name = self.resolve_image(android_version)
         os_name = platform.system()
         if not self.is_linux():
             return {
@@ -141,7 +157,7 @@ class RedroidManager:
                 "os": os_name,
                 "docker_sdk_installed": DOCKER_SDK_AVAILABLE,
                 "docker_available": False,
-                "image_name": REDROID_IMAGE,
+                "image_name": image_name,
                 "image_exists": False,
                 "pulling_image": False,
                 "pull_status": None,
@@ -158,7 +174,7 @@ class RedroidManager:
                 "os": os_name,
                 "docker_sdk_installed": DOCKER_SDK_AVAILABLE,
                 "docker_available": False,
-                "image_name": REDROID_IMAGE,
+                "image_name": image_name,
                 "image_exists": False,
                 "pulling_image": self.is_pulling_image,
                 "pull_status": self._pull_status_message,
@@ -169,21 +185,21 @@ class RedroidManager:
             }
 
         try:
-            image_exists = self.check_image_exists(client)
+            image_exists = self.check_image_exists(client, android_version=android_version)
             containers = self._list_containers_with_client(client)
             return {
                 "supported": True,
                 "os": os_name,
                 "docker_sdk_installed": DOCKER_SDK_AVAILABLE,
                 "docker_available": True,
-                "image_name": REDROID_IMAGE,
+                "image_name": image_name,
                 "image_exists": image_exists,
                 "pulling_image": self.is_pulling_image,
                 "pull_status": self._pull_status_message,
                 "active_containers": len(containers),
                 "containers": containers,
                 "ready": image_exists and not self.is_pulling_image,
-                "error": None if image_exists else f"Image '{REDROID_IMAGE}' is not installed yet.",
+                "error": None if image_exists else f"Image '{image_name}' is not installed yet.",
             }
         except Exception as e:
             logger.error(f"Failed to query Redroid status: {e}")
@@ -192,7 +208,7 @@ class RedroidManager:
                 "os": os_name,
                 "docker_sdk_installed": DOCKER_SDK_AVAILABLE,
                 "docker_available": False,
-                "image_name": REDROID_IMAGE,
+                "image_name": image_name,
                 "image_exists": False,
                 "pulling_image": self.is_pulling_image,
                 "pull_status": self._pull_status_message,
@@ -210,27 +226,29 @@ class RedroidManager:
     def pull_image(
         self,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        android_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Pulls `redroid/redroid:11.0.0-latest` synchronously (call inside a thread / asyncio.to_thread).
+        Pulls `redroid/redroid:<android_version>` synchronously (call inside a thread / asyncio.to_thread).
         Streams progress events to `progress_callback` if provided.
         """
+        image_name = self.resolve_image(android_version)
         with self._lock:
             if self._pulling_image:
                 return {"success": True, "already_pulling": True, "message": "Image pull already in progress."}
             self._pulling_image = True
-            self._pull_status_message = f"Pulling {REDROID_IMAGE}..."
+            self._pull_status_message = f"Pulling {image_name}..."
 
         client = None
         try:
             client = self._get_client()
-            repo, tag = REDROID_IMAGE.split(":", 1)
+            repo, tag = image_name.split(":", 1)
             if progress_callback:
                 progress_callback({
                     "stage": "pull_image",
                     "status": "progress",
                     "title": "Redroid Image",
-                    "message": f"Downloading Docker image {REDROID_IMAGE}...",
+                    "message": f"Downloading Docker image {image_name}...",
                 })
 
             last_emit = 0.0
@@ -245,7 +263,7 @@ class RedroidManager:
                 prog = chunk.get("progress", "")
                 if layer_id and st:
                     layers_seen[layer_id] = st
-                msg = f"{st} {layer_id} {prog}".strip() if st else f"Pulling {REDROID_IMAGE}..."
+                msg = f"{st} {layer_id} {prog}".strip() if st else f"Pulling {image_name}..."
                 self._pull_status_message = msg
 
                 now = time.time()
@@ -260,7 +278,7 @@ class RedroidManager:
                         "stage": "pull_image",
                         "status": "progress",
                         "title": "Redroid Image",
-                        "message": f"Pulling {REDROID_IMAGE}: {st or 'Downloading...'} ({done_layers}/{total_layers} layers)",
+                        "message": f"Pulling {image_name}: {st or 'Downloading...'} ({done_layers}/{total_layers} layers)",
                     })
 
             self._pull_status_message = "Image ready"
@@ -269,9 +287,9 @@ class RedroidManager:
                     "stage": "pull_image",
                     "status": "success",
                     "title": "Redroid Image Ready",
-                    "message": f"Successfully installed {REDROID_IMAGE}. You can now deploy Android 11 instances.",
+                    "message": f"Successfully installed {image_name}. You can now deploy instances.",
                 })
-            return {"success": True, "image": REDROID_IMAGE, "message": f"Image {REDROID_IMAGE} installed."}
+            return {"success": True, "image": image_name, "message": f"Image {image_name} installed."}
         except Exception as e:
             logger.error(f"Redroid image pull failed: {e}")
             self._pull_status_message = f"Pull failed: {e}"
@@ -280,7 +298,7 @@ class RedroidManager:
                     "stage": "pull_image",
                     "status": "error",
                     "title": "Redroid Image Error",
-                    "message": f"Failed to pull {REDROID_IMAGE}: {e}",
+                    "message": f"Failed to pull {image_name}: {e}",
                 })
             raise
         finally:
@@ -360,16 +378,18 @@ class RedroidManager:
         adb_port: Optional[int] = None,
         display_name: Optional[str] = None,
         bind_to_uuid: Optional[str] = None,
+        android_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Spawns a new privileged Redroid Android 11 container equivalent to:
+        Spawns a new privileged Redroid Android container equivalent to:
         docker run -itd --privileged --pull always -v ~/data_<uuid>:/data
-          -p <adb_port>:5555 --name <container_name> redroid/redroid:11.0.0-latest
+          -p <adb_port>:5555 --name <container_name> redroid/redroid:<android_version>
           androidboot.redroid_width=720 androidboot.redroid_height=1280
           androidboot.redroid_dpi=320 androidboot.redroid_fps=30
           androidboot.redroid_gpu.mode=guest
           redroid.memory.size=1536M ro.product.cpu.abilist=x86_64,arm64-v8a
         """
+        image_name = self.resolve_image(android_version)
         self.ensure_binder_support()
         client = self._get_client()
         try:
@@ -392,20 +412,20 @@ class RedroidManager:
                     raise ValueError(f"Invalid ADB port: {port}")
 
             # Ensure image exists locally (pull if missing, mimicking --pull)
-            if not self.check_image_exists(client):
-                logger.info(f"Image {REDROID_IMAGE} not found locally; pulling before deploy...")
-                repo, tag = REDROID_IMAGE.split(":", 1)
+            if not self.check_image_exists(client, android_version=android_version):
+                logger.info(f"Image {image_name} not found locally; pulling before deploy...")
+                repo, tag = image_name.split(":", 1)
                 client.images.pull(repo, tag=tag)
 
             data_dir = os.path.expanduser(f"~/data_{uid_short}")
             os.makedirs(data_dir, exist_ok=True)
 
             logger.info(
-                f"Deploying Redroid container '{cname}' on 127.0.0.1:{port} (data={data_dir})..."
+                f"Deploying Redroid container '{cname}' ({image_name}) on 127.0.0.1:{port} (data={data_dir})..."
             )
 
             container = client.containers.run(
-                image=REDROID_IMAGE,
+                image=image_name,
                 command=REDROID_BOOT_ARGS,
                 name=cname,
                 detach=True,

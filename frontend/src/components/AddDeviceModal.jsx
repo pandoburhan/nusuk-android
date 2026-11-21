@@ -69,6 +69,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
   const [containerActionId, setContainerActionId] = useState(null);
   const [confirmDeleteContainer, setConfirmDeleteContainer] = useState(null);
   const [bindToUuid, setBindToUuid] = useState('');
+  const [androidVersion, setAndroidVersion] = useState('11.0.0-latest');
   const [migrationTargets, setMigrationTargets] = useState([]);
   const [loadingMigrationTargets, setLoadingMigrationTargets] = useState(false);
 
@@ -115,7 +116,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
     setRedroidLoading(true);
     setError('');
     try {
-      const res = await redroidApi.getStatus();
+      const res = await redroidApi.getStatus(androidVersion);
       const d = res.data;
       setRedroidStatus(d);
       setPullingImage(Boolean(d?.pulling_image));
@@ -129,7 +130,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
     } finally {
       setRedroidLoading(false);
     }
-  }, []);
+  }, [androidVersion]);
 
   // Load all active + archived instances for Redroid identity migration
   const loadMigrationTargets = useCallback(async () => {
@@ -215,10 +216,10 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
 
   const handleInstallRedroidImage = async () => {
     setPullingImage(true);
-    setPullProgressMsg('Memulai unduhan image redroid/redroid:11.0.0-latest...');
+    setPullProgressMsg(`Memulai unduhan image redroid/redroid:${androidVersion}...`);
     setError('');
     try {
-      const res = await redroidApi.installImage();
+      const res = await redroidApi.installImage({ android_version: androidVersion });
       const d = res.data;
       if (d?.data?.already_exists) {
         setPullingImage(false);
@@ -244,6 +245,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
       const payload = {
         ...(name.trim() ? { name: name.trim() } : {}),
         bind_to_uuid: bindToUuid || null,
+        android_version: androidVersion,
       };
       await redroidApi.deployInstance(payload);
       toast?.({
@@ -819,7 +821,28 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                   Deploy New Instance (Android 11)
                 </button>
               </div>
-            ) : !redroidStatus.image_exists ? (
+            ) : (
+              <div className="space-y-3">
+                <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-1.5">
+                  <label
+                    htmlFor="redroid-android-version"
+                    className="block text-[11px] font-medium text-slate-300"
+                  >
+                    Android Version
+                  </label>
+                  <select
+                    id="redroid-android-version"
+                    value={androidVersion}
+                    onChange={(e) => setAndroidVersion(e.target.value)}
+                    disabled={pullingImage || deployingRedroid}
+                    className="w-full px-2.5 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
+                  >
+                    <option value="11.0.0-latest">Android 11</option>
+                    <option value="9.0.0-latest">Android 9</option>
+                  </select>
+                </div>
+
+                {!redroidStatus.image_exists ? (
               <div className="p-4 rounded-xl bg-slate-950/80 border border-indigo-800/60 space-y-3">
                 <div className="space-y-1">
                   <Line ok={true}>
@@ -904,7 +927,9 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     ) : (
                       <Rocket className="w-4 h-4" />
                     )}
-                    {deployingRedroid ? 'Deploying…' : 'Deploy New Instance (Android 11)'}
+                    {deployingRedroid
+                      ? 'Deploying…'
+                      : `Deploy New Instance (${androidVersion === '9.0.0-latest' ? 'Android 9' : 'Android 11'})`}
                   </button>
 
                   {deployProgress && (
@@ -1038,6 +1063,8 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     </div>
                   )}
                 </div>
+              </div>
+                )}
               </div>
             )}
           </div>

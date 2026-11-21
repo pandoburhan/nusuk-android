@@ -15,11 +15,11 @@ from backend.event_log import log_event
 from backend.models import Instance, LogSeverity
 from backend.orchestrator import orchestrator
 from backend.redroid_manager import (
-    REDROID_IMAGE,
+    DEFAULT_ANDROID_VERSION,
     RedroidNotSupportedError,
     redroid_manager,
 )
-from backend.schemas import ActionResponse, RedroidDeployRequest
+from backend.schemas import ActionResponse, RedroidDeployRequest, RedroidInstallImageRequest
 from backend.telemetry import telemetry_manager
 
 logger = logging.getLogger(__name__)
@@ -34,30 +34,33 @@ def _track_task(task: asyncio.Task) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _bg_pull_image() -> None:
+async def _bg_pull_image(android_version: str = DEFAULT_ANDROID_VERSION) -> None:
     def _emit(event_data):
         telemetry_manager.emit_sync("redroid_provisioning_event", event_data)
 
+    image_name = redroid_manager.resolve_image(android_version)
     try:
-        await asyncio.to_thread(redroid_manager.pull_image, _emit)
-        log_event(LogSeverity.INFO, "REDROID", f"Docker image {REDROID_IMAGE} berhasil diunduh.")
+        await asyncio.to_thread(redroid_manager.pull_image, _emit, android_version)
+        log_event(LogSeverity.INFO, "REDROID", f"Docker image {image_name} berhasil diunduh.")
     except Exception as e:
         logger.error(f"Background Redroid image pull failed: {e}")
-        log_event(LogSeverity.ERROR, "REDROID", f"Gagal mengunduh image {REDROID_IMAGE}: {e}")
+        log_event(LogSeverity.ERROR, "REDROID", f"Gagal mengunduh image {image_name}: {e}")
 
 
 async def _bg_deploy_and_provision(
     display_name: Optional[str] = None,
     adb_port: Optional[int] = None,
     bind_to_uuid: Optional[str] = None,
+    android_version: Optional[str] = None,
 ) -> None:
+    ver_label = "Android 9" if (android_version or "").startswith("9") else "Android 11"
     telemetry_manager.emit_sync(
         "redroid_provisioning_event",
         {
             "stage": "deploying",
             "status": "progress",
             "title": "Redroid Deploy",
-            "message": "Starting new Redroid Android 11 container...",
+            "message": f"Starting new Redroid {ver_label} container...",
         },
     )
 
@@ -69,6 +72,7 @@ async def _bg_deploy_and_provision(
             adb_port,
             display_name,
             bind_to_uuid,
+            android_version,
         )
         log_event(
             LogSeverity.INFO,
@@ -110,15 +114,20 @@ async def _bg_deploy_and_provision(
 
 
 @router.get("/status")
-async def get_redroid_status():
+async def get_redroid_status(android_version: Optional[str] = DEFAULT_ANDROID_VERSION):
     """Check host OS, Docker daemon connectivity, Redroid image availability, and running containers."""
-    return await asyncio.to_thread(redroid_manager.get_status)
+    return await asyncio.to_thread(redroid_manager.get_status, android_version)
 
 
 @router.post("/install-image", response_model=ActionResponse)
-async def install_redroid_image():
-    """Trigger asynchronous `docker pull redroid/redroid:11.0.0-latest` with WebSocket progress updates."""
-    status = await asyncio.to_thread(redroid_manager.get_status)
+async def install_redroid_image(payload: Optional[RedroidInstallImageRequest] = Body(default=None)):
+    """Trigger asynchronous `docker pull redroid/redroid:<android_version>` with WebSocket progress updates."""
+    req_version = (
+        (payload.android_version or "").strip() if payload else ""
+    ) or DEFAULT_ANDROID_VERSION
+    image_name = redroid_manager.resolve_image(req_version)
+
+    status = await asyncio.to_thread(redroid_manager.get_status, req_version)
     if not status.get("supported"):
         raise HTTPException(
             status_code=400,
@@ -132,22 +141,22 @@ async def install_redroid_image():
     if status.get("image_exists"):
         return ActionResponse(
             success=True,
-            message=f"Image {REDROID_IMAGE} sudah terpasang.",
-            data={"already_exists": True, "pulling": False},
+            message=f"Image {image_name} sudah terpasang.",
+            data={"already_exists": True, "pulling": False, "image": image_name},
         )
     if status.get("pulling_image"):
         return ActionResponse(
             success=True,
-            message=f"Proses unduh {REDROID_IMAGE} sedang berjalan di latar belakang.",
-            data={"already_exists": False, "pulling": True},
+            message=f"Proses unduh {image_name} sedang berjalan di latar belakang.",
+            data={"already_exists": False, "pulling": True, "image": image_name},
         )
 
-    task = asyncio.create_task(_bg_pull_image())
+    task = asyncio.create_task(_bg_pull_image(req_version))
     _track_task(task)
     return ActionResponse(
         success=True,
-        message=f"Memulai unduhan image {REDROID_IMAGE} di latar belakang. Progres akan dikirim via WebSocket.",
-        data={"already_exists": False, "pulling": True, "image": REDROID_IMAGE},
+        message=f"Memulai unduhan image {image_name} di latar belakang. Progres akan dikirim via WebSocket.",
+        data={"already_exists": False, "pulling": True, "image": image_name},
     )
 
 
@@ -157,7 +166,12 @@ async def deploy_redroid(payload: Optional[RedroidDeployRequest] = Body(default=
     Trigger asynchronous deployment + auto-provisioning (ADB connect -> anchor -> Nusuk Split APKs -> DB insert).
     Returns immediately while progress broadcasts over `/ws/telemetry`.
     """
-    status = await asyncio.to_thread(redroid_manager.get_status)
+    req_version = (
+        (payload.android_version or "").strip() if payload else ""
+    ) or DEFAULT_ANDROID_VERSION
+    image_name = redroid_manager.resolve_image(req_version)
+
+    status = await asyncio.to_thread(redroid_manager.get_status, req_version)
     if not status.get("supported") or not status.get("docker_available"):
         raise HTTPException(
             status_code=400,
@@ -172,7 +186,7 @@ async def deploy_redroid(payload: Optional[RedroidDeployRequest] = Body(default=
     if not status.get("image_exists"):
         raise HTTPException(
             status_code=400,
-            detail=f"Image '{REDROID_IMAGE}' belum terpasang. Klik 'Install Redroid Image' terlebih dahulu.",
+            detail=f"Image '{image_name}' belum terpasang. Klik 'Install Redroid Image' terlebih dahulu.",
         )
 
     try:
@@ -201,6 +215,7 @@ async def deploy_redroid(payload: Optional[RedroidDeployRequest] = Body(default=
             display_name=req_name,
             adb_port=req_port,
             bind_to_uuid=req_bind_uuid,
+            android_version=req_version,
         )
     )
     _track_task(task)
@@ -208,7 +223,12 @@ async def deploy_redroid(payload: Optional[RedroidDeployRequest] = Body(default=
     return ActionResponse(
         success=True,
         message="Deploying new instance in the background. It will appear on the dashboard soon.",
-        data={"queued": True, "name": req_name, "bind_to_uuid": req_bind_uuid},
+        data={
+            "queued": True,
+            "name": req_name,
+            "bind_to_uuid": req_bind_uuid,
+            "android_version": req_version,
+        },
     )
 
 
