@@ -57,7 +57,7 @@ async def _bg_deploy_and_provision(
             "stage": "deploying",
             "status": "progress",
             "title": "Redroid Deploy",
-            "message": "Starting new Redroid Android 9 container...",
+            "message": "Starting new Redroid Android 11 container...",
         },
     )
 
@@ -117,7 +117,7 @@ async def get_redroid_status():
 
 @router.post("/install-image", response_model=ActionResponse)
 async def install_redroid_image():
-    """Trigger asynchronous `docker pull redroid/redroid:9.0.0-latest` with WebSocket progress updates."""
+    """Trigger asynchronous `docker pull redroid/redroid:11.0.0-latest` with WebSocket progress updates."""
     status = await asyncio.to_thread(redroid_manager.get_status)
     if not status.get("supported"):
         raise HTTPException(

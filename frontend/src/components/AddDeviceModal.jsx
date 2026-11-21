@@ -215,7 +215,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
 
   const handleInstallRedroidImage = async () => {
     setPullingImage(true);
-    setPullProgressMsg('Memulai unduhan image redroid/redroid:9.0.0-latest...');
+    setPullProgressMsg('Memulai unduhan image redroid/redroid:11.0.0-latest...');
     setError('');
     try {
       const res = await redroidApi.installImage();
@@ -778,7 +778,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
           <div className="space-y-3 text-xs">
             <div className="flex items-center justify-between">
               <span className="text-[11px] text-slate-400">
-                Deploy emulator Android 9 headless instan via Docker Engine (Linux VPS).
+                Deploy emulator Android 11 headless instan via Docker Engine (Linux VPS).
               </span>
               <button
                 type="button"
@@ -816,7 +816,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                   className="w-full py-2.5 px-3 rounded-xl bg-slate-800 text-slate-500 border border-slate-700 font-semibold cursor-not-allowed flex items-center justify-center gap-1.5"
                 >
                   <Rocket className="w-3.5 h-3.5" />
-                  Deploy New Instance (Android 9)
+                  Deploy New Instance (Android 11)
                 </button>
               </div>
             ) : !redroidStatus.image_exists ? (
@@ -904,7 +904,7 @@ export default function AddDeviceModal({ onClose, toast, refreshInstances, lastR
                     ) : (
                       <Rocket className="w-4 h-4" />
                     )}
-                    {deployingRedroid ? 'Deploying…' : 'Deploy New Instance (Android 9)'}
+                    {deployingRedroid ? 'Deploying…' : 'Deploy New Instance (Android 11)'}
                   </button>
 
                   {deployProgress && (

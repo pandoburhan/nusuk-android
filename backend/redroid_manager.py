@@ -1,7 +1,7 @@
 """
 Redroid Docker Orchestration Manager (Linux Only).
 Communicates with the local Docker daemon via Docker SDK for Python to manage
-headless Redroid Android 9 containers (`redroid/redroid:9.0.0-latest`).
+headless Redroid Android 11 containers (`redroid/redroid:11.0.0-latest`).
 
 Designed to fail gracefully on non-Linux hosts (Windows/macOS) or when the Docker
 SDK/daemon is unavailable.
@@ -33,7 +33,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-REDROID_IMAGE = "redroid/redroid:9.0.0-latest"
+REDROID_IMAGE = "redroid/redroid:11.0.0-latest"
 CONTAINER_PREFIX = "nusuk_redroid_"
 ADB_PORT_MIN = 5556
 ADB_PORT_MAX = 6000
@@ -212,7 +212,7 @@ class RedroidManager:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """
-        Pulls `redroid/redroid:9.0.0-latest` synchronously (call inside a thread / asyncio.to_thread).
+        Pulls `redroid/redroid:11.0.0-latest` synchronously (call inside a thread / asyncio.to_thread).
         Streams progress events to `progress_callback` if provided.
         """
         with self._lock:
@@ -269,7 +269,7 @@ class RedroidManager:
                     "stage": "pull_image",
                     "status": "success",
                     "title": "Redroid Image Ready",
-                    "message": f"Successfully installed {REDROID_IMAGE}. You can now deploy Android 9 instances.",
+                    "message": f"Successfully installed {REDROID_IMAGE}. You can now deploy Android 11 instances.",
                 })
             return {"success": True, "image": REDROID_IMAGE, "message": f"Image {REDROID_IMAGE} installed."}
         except Exception as e:
@@ -362,9 +362,9 @@ class RedroidManager:
         bind_to_uuid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Spawns a new privileged Redroid Android 9 container equivalent to:
-        docker run -itd --rm --privileged --pull always -v ~/data_<uuid>:/data
-          -p <adb_port>:5555 --name <container_name> redroid/redroid:9.0.0-latest
+        Spawns a new privileged Redroid Android 11 container equivalent to:
+        docker run -itd --privileged --pull always -v ~/data_<uuid>:/data
+          -p <adb_port>:5555 --name <container_name> redroid/redroid:11.0.0-latest
           androidboot.redroid_width=720 androidboot.redroid_height=1280
           androidboot.redroid_dpi=320 androidboot.redroid_fps=30
           androidboot.redroid_gpu.mode=guest
@@ -411,7 +411,7 @@ class RedroidManager:
                 detach=True,
                 stdin_open=True,
                 tty=True,
-                auto_remove=True,
+                auto_remove=False,
                 privileged=True,
                 volumes={data_dir: {"bind": "/data", "mode": "rw"}},
                 ports={"5555/tcp": port},
