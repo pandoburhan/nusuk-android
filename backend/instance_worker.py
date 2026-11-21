@@ -362,11 +362,31 @@ class InstanceWorker:
             except Exception as e:
                 logger.error(f"Error rolling back claim: {e}")
 
+    def _spoof_adb_status(self):
+        """Hide ADB & Developer Mode flags in Settings.Global before launching Nusuk."""
+        if not self.d:
+            return
+        try:
+            self.log_system(
+                LogSeverity.INFO,
+                "ANTI_DETECTION",
+                "Melakukan spoofing status ADB & Developer Mode",
+            )
+            self.d.shell("settings put global adb_enabled 0")
+            self.d.shell("settings put global development_settings_enabled 0")
+        except Exception as e:
+            self.log_system(
+                LogSeverity.WARNING,
+                "ANTI_DETECTION",
+                f"Gagal melakukan spoofing status ADB & Developer Mode: {e}",
+            )
+
     def _return_to_homepage(self):
         """Return Nusuk to the home screen (restart app, dismiss location popup)."""
         try:
             self.update_telemetry_status("Returning app to Homepage...", bot_status="STOPPING")
             adb_manager.clear_ram(self.device_id)
+            self._spoof_adb_status()
             adb_manager.launch_app(self.device_id)
             start_t = time.time()
             while time.time() - start_t < 15.0:
@@ -584,6 +604,7 @@ class InstanceWorker:
         adb_manager.clear_ram(self.device_id)
         if self._stop_requested:
             return
+        self._spoof_adb_status()
         adb_manager.launch_app(self.device_id)
 
         start_wait = time.time()

@@ -46,6 +46,9 @@ REDROID_BOOT_ARGS = [
     "androidboot.redroid_gpu.mode=guest",
     "redroid.memory.size=1536M",
     "ro.product.cpu.abilist=x86_64,arm64-v8a",
+    "ro.secure=1",
+    "ro.debuggable=0",
+    "ro.kernel.qemu=0",
 ]
 
 
