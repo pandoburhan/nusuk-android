@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import time
-import webbrowser
 
 IS_WINDOWS = os.name == "nt" or platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -100,12 +99,6 @@ def verify_and_prepare_adb(root_dir: str) -> str:
 
     print(f"[+] Binary ADB lokal terverifikasi ({platform.system()}): {adb_path}")
     return adb_path
-
-
-def has_gui_display() -> bool:
-    if IS_WINDOWS or platform.system() == "Darwin":
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def resolve_python_executable(root_dir: str) -> str:
@@ -229,12 +222,6 @@ def main():
         print(f" [+] Backend API & Swagger Docs  : http://127.0.0.1:{args.port}/docs")
     print("=" * 65)
     print(" Tekan Ctrl+C untuk menghentikan seluruh sistem dengan aman.\n")
-
-    if not args.no_browser and has_gui_display():
-        try:
-            webbrowser.open(local_url)
-        except Exception:
-            pass
 
     stopping = False
 
