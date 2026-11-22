@@ -17,7 +17,7 @@ from backend.database import SessionLocal
 from backend.models import (
     QuizLog, QuizResultStatus, LogSeverity, ClaimStatus, Instance,
 )
-from backend.adb_manager import adb_manager
+from backend.adb_manager import adb_manager, is_transport_or_socket_error
 from backend.quiz_solver import quiz_solver, AISolverError
 from backend.screen_classifier import (
     screen_classifier, ScreenState, bounds_center, is_bounds_in_viewport, scale_ref_xy,
@@ -26,6 +26,7 @@ from backend.telemetry import telemetry_manager
 from backend.event_log import log_event
 from backend.instance_manager import instance_manager, LoginStatus
 from backend.time_service import utc_now_naive
+from backend.forensic_service import forensic_service
 from backend import key_service
 
 logger = logging.getLogger(__name__)
@@ -263,7 +264,7 @@ class InstanceWorker:
         raise DeviceOffline()
 
     # ------------------------------------------------------------------ lifecycle
-    def start(self, mode: str, stop_mode: str = "limit", stop_limit: int = 100) -> bool:
+    def start(self, mode: str, stop_mode: str = "limit", stop_limit: int = 100, initial_completed: int = 0) -> bool:
         with self._lock:
             if self.is_running:
                 return False
@@ -275,7 +276,7 @@ class InstanceWorker:
                     self.stop_limit = 100
             except (ValueError, TypeError):
                 self.stop_limit = 100
-            self.session_completed_count = 0
+            self.session_completed_count = max(0, int(initial_completed or 0))
 
             self._stop_requested = False
             self._stop_event.clear()
@@ -293,10 +294,18 @@ class InstanceWorker:
             self._custom_stop_step = None
             self._login_alert_sent_state = None
             instance_manager.clear_login_inputs(self.uuid)
-            instance_manager.set_runtime(self.uuid, emit=False, login_error=None)
+            instance_manager.set_runtime(
+                self.uuid,
+                emit=False,
+                login_error=None,
+                stop_mode=self.stop_mode,
+                stop_limit=self.stop_limit,
+                session_completed_count=self.session_completed_count,
+            )
+            progres_str = f" [Resume progres: {self.session_completed_count}/{self.stop_limit}]" if self.session_completed_count > 0 else ""
             self.log_system(LogSeverity.INFO, "BOT_CONTROL",
-                            f"Starting bot in mode '{mode}' on target {self.device_id} (Stop condition: {self.stop_mode}, target={self.stop_limit})")
-            self.update_telemetry_status(f"Starting bot in mode '{mode}'...", bot_status="RUNNING")
+                            f"Starting bot in mode '{mode}' on target {self.device_id} (Stop condition: {self.stop_mode}, target={self.stop_limit}){progres_str}")
+            self.update_telemetry_status(f"Starting bot in mode '{mode}'{progres_str}...", bot_status="RUNNING")
             self._worker_thread = threading.Thread(target=self._run_loop, name=f"worker-{self.uuid[:8]}", daemon=True)
             self._worker_thread.start()
             return True
@@ -442,6 +451,8 @@ class InstanceWorker:
         for attempt in range(max_retries + 1):
             try:
                 xml = self._dump_xml_fast()
+                if xml:
+                    self._last_raw_xml = xml
                 if not xml or "<hierarchy" not in xml:
                     if attempt < max_retries:
                         if not self._sleep(retry_delay):
@@ -462,12 +473,17 @@ class InstanceWorker:
                     xml, current_package=None, screen_w=self._screen_w, screen_h=self._screen_h
                 )
 
+                # Prioritize system dialog/ANR: do not overwrite to LAUNCHER_OR_CLOSED
+                if info["state"] == ScreenState.SCREEN_SYSTEM_DIALOG:
+                    self.current_screen = info["state"]
+                    self.last_inspect_info = info
+                    return info
+
                 # Guard #1: Only bypass `app_current()` (dumpsys) when XML clearly belongs
                 # to com.moh.nusukapp, has no Android crash dialog, and resolved to a known screen.
                 need_pkg_check = (
                     verify_package
                     or not info.get("has_nusuk_package")
-                    or info.get("has_system_crash_dialog")
                     or info["state"] == ScreenState.SCREEN_UNKNOWN_OR_LOADING
                 )
                 if need_pkg_check:
@@ -490,6 +506,8 @@ class InstanceWorker:
                 return info
             except Exception as e:
                 logger.debug(f"Inspection attempt {attempt + 1} error on {self.device_id}: {e}")
+                if is_transport_or_socket_error(e):
+                    raise
                 if attempt < max_retries:
                     if not self._sleep(retry_delay):
                         return {"state": ScreenState.SCREEN_UNKNOWN_OR_LOADING}
@@ -667,11 +685,13 @@ class InstanceWorker:
         if status == ClaimStatus.USED and self.active_mode == "redeem_only":
             self.session_completed_count += 1
             instance_manager.set_runtime(self.uuid, session_completed_count=self.session_completed_count)
+            instance_manager.update_task_progress(self.uuid, self.session_completed_count)
             if self.stop_mode == "limit" and self.session_completed_count >= self.stop_limit:
                 msg = f"Target stop condition tercapai: {self.session_completed_count}/{self.stop_limit} key sukses dimasukkan. Bot berhenti elegan."
                 self.log_system(LogSeverity.INFO, "BOT_CONTROL", msg)
                 self.update_telemetry_status(msg, bot_status="IDLE")
                 self._alert("info", msg)
+                instance_manager.clear_task_intent(self.uuid, "Target limit reached")
                 self._stop_requested = True
 
     def _record_quiz_log(self, door: str, question: str, options: List[str], chosen_ans: str, chosen_idx: int,
@@ -743,6 +763,7 @@ class InstanceWorker:
 
             step_msg = "Daily Limit Reached — Coba lagi besok (reset 00:00 Arab Saudi)"
             self._custom_stop_step = step_msg
+            instance_manager.clear_task_intent(self.uuid, "Daily limit reached")
             self.log_system(
                 LogSeverity.WARNING,
                 "DAILY_LIMIT",
@@ -1102,11 +1123,13 @@ class InstanceWorker:
         if self.active_mode in ("answer_only", "auto"):
             self.session_completed_count += 1
             instance_manager.set_runtime(self.uuid, session_completed_count=self.session_completed_count)
+            instance_manager.update_task_progress(self.uuid, self.session_completed_count)
             if self.stop_mode == "limit" and self.session_completed_count >= self.stop_limit:
                 msg = f"Target stop condition tercapai: {self.session_completed_count}/{self.stop_limit} soal berhasil dijawab. Bot berhenti elegan."
                 self.log_system(LogSeverity.INFO, "BOT_CONTROL", msg)
                 self.update_telemetry_status(msg, bot_status="IDLE")
                 self._alert("info", msg)
+                instance_manager.clear_task_intent(self.uuid, "Target limit reached")
                 self._stop_requested = True
                 return
 
@@ -1907,84 +1930,236 @@ class InstanceWorker:
                 else:
                     self._prefetched_info = fresh
 
+    def _handle_screen_system_dialog(self, info: Dict[str, Any]):
+        """
+        Handle Android system warning, ANR ('isn't responding'), and crash dialogs
+        without destroying worker state or active task intent.
+        """
+        diag_data = info.get("system_dialog_data") or {}
+        diag_title = diag_data.get("title") or "System Dialog"
+        diag_msg = diag_data.get("message") or ""
+        diag_target = diag_data.get("dialog_target", "unknown")
+        is_anr = diag_data.get("is_anr", False)
+        is_crash = diag_data.get("is_crash", False)
+        wait_bounds = diag_data.get("wait_bounds")
+        close_bounds = diag_data.get("close_bounds")
+        restart_bounds = diag_data.get("restart_bounds")
+        ok_bounds = diag_data.get("ok_bounds")
+
+        # 1. Forensic dump of XML hierarchy
+        try:
+            dump_res = forensic_service.dump(
+                self.uuid,
+                self.name,
+                category="system_anr" if is_anr else "system_dialog",
+                reason=f"{diag_target}_{diag_title}",
+                xml_content=getattr(self, "_last_raw_xml", ""),
+            )
+            if dump_res and dump_res[0]:
+                self.log_system(LogSeverity.INFO, "FORENSIC", f"Forensic XML dump tersimpan di: {dump_res[0]}")
+        except Exception as fe:
+            logger.debug(f"Forensic dump error: {fe}")
+
+        self.log_system(
+            LogSeverity.WARNING,
+            "SYSTEM_WARNING",
+            f"Dialog sistem terdeteksi: '{diag_title}' ({diag_msg}) [target: {diag_target}]. Menjalankan pemulihan non-destruktif...",
+        )
+        self.update_telemetry_status(f"Menangani dialog sistem: {diag_title}...")
+
+        # 2. Smart recovery strategy
+        if diag_target == "system" or (is_anr and wait_bounds and not is_crash):
+            # Prioritize 'Wait' / 'Tunggu' button for OS/launcher ANRs so background tasks can catch up
+            if wait_bounds:
+                self.log_system(LogSeverity.INFO, "SYSTEM_WARNING", "Mencoba menekan tombol 'Wait' / 'Tunggu'...")
+                self._click_bounds(wait_bounds)
+                if not self._sleep(0.8):
+                    return
+                fresh = self._inspect_screen(max_retries=1)
+                if fresh["state"] != ScreenState.SCREEN_SYSTEM_DIALOG:
+                    self.log_system(LogSeverity.INFO, "SYSTEM_WARNING", "Dialog berhasil dilewati via 'Wait'. Melanjutkan otomatisasi.")
+                    self._prefetched_info = fresh
+                    return
+
+            # If Wait failed or wasn't available, click Close / OK
+            btn_clicked = False
+            for target_btn in (close_bounds, ok_bounds, restart_bounds):
+                if target_btn:
+                    self._click_bounds(target_btn)
+                    btn_clicked = True
+                    break
+            if not btn_clicked and self.d:
+                try:
+                    self.d.press("back")
+                except Exception:
+                    pass
+            if not self._sleep(0.6):
+                return
+            # Bring Nusuk back to foreground
+            adb_manager.launch_app(self.device_id)
+        else:
+            # Target is Nusuk app itself (e.g. "Nusuk isn't responding" / "Nusuk keeps stopping")
+            self._safe_rollback_key()
+            btn_clicked = False
+            for target_btn in (close_bounds, ok_bounds, restart_bounds):
+                if target_btn:
+                    self._click_bounds(target_btn)
+                    btn_clicked = True
+                    break
+            if not btn_clicked and self.d:
+                try:
+                    self.d.press("back")
+                except Exception:
+                    pass
+            if not self._sleep(0.6):
+                return
+
+            self.log_system(
+                LogSeverity.WARNING,
+                "APP_RECOVERY",
+                f"Memulihkan aplikasi Nusuk setelah dialog '{diag_title}' (clear RAM & relaunch)...",
+            )
+            adb_manager.clear_ram(self.device_id)
+            self._spoof_adb_status()
+            adb_manager.launch_app(self.device_id)
+
+        # Smart wait up to 15s for Nusuk to return to an active screen
+        t_wait = time.monotonic()
+        while time.monotonic() - t_wait < 15.0:
+            if self._stop_requested:
+                return
+            if not self._sleep(0.5):
+                return
+            fresh = self._inspect_screen(max_retries=0)
+            if fresh["state"] in AUTHENTICATED_STATES or fresh["state"] in LOGIN_FLOW_STATES or fresh["state"] == ScreenState.SCREEN_LOCATION_POPUP:
+                self.log_system(LogSeverity.INFO, "APP_RECOVERY", f"Pemulihan berhasil — layar kembali ke: {fresh['state']}")
+                self._prefetched_info = fresh
+                return
+
     # ------------------------------------------------------------------ MAIN WORKER LOOP
     def _run_loop(self):
         logger.info(f"Worker [{self.name}] started in mode '{self.active_mode}' on {self.device_id}")
         went_offline = False
+        transport_retries = 0
         try:
             if not self.connect_device():
                 raise DeviceOffline()
             while not self._stop_requested:
-                if self._prefetched_info is not None:
-                    info = self._prefetched_info
-                    self._prefetched_info = None
-                else:
-                    info = self._inspect_screen()
-                state = info["state"]
-
-                if state == ScreenState.SCREEN_UNKNOWN_OR_LOADING and not self.d:
-                    self._check_still_online(force=True)
-
-                if state != ScreenState.SCREEN_UNKNOWN_OR_LOADING:
-                    self.consecutive_unknown_count = 0
-                    self.consecutive_recoveries = 0
-                    self.unknown_first_seen_time = None
-
-                # Confirm LOGGED_IN whenever worker reaches any authenticated screen
-                if state in AUTHENTICATED_STATES:
-                    rt = instance_manager.rt(self.uuid)
-                    if rt.login_status != LoginStatus.LOGGED_IN or rt.login_error:
-                        self._login_alert_sent_state = None
-                        self._set_login_state(LoginStatus.LOGGED_IN, clear_error=True)
-
-                if state == ScreenState.SCREEN_LAUNCHER_OR_CLOSED:
-                    self._execute_auto_recovery("Nusuk app was closed or crashed")
-                elif state == ScreenState.SCREEN_WELCOME_SLIDES:
-                    self._handle_screen_welcome_slides(info)
-                elif state in (
-                    ScreenState.SCREEN_LOGIN_MAIN,
-                    ScreenState.SCREEN_LOGIN_METHOD_POPUP,
-                    ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT,
-                    ScreenState.SCREEN_CREDENTIALS_FORM,
-                ):
-                    self._handle_screen_awaiting_credentials(info)
-                elif state == ScreenState.SCREEN_VERIFY_OTP_FORM:
-                    self._handle_screen_verify_otp(info)
-                elif state == ScreenState.SCREEN_DAILY_LIMIT_POPUP:
-                    self._handle_screen_daily_limit_popup(info)
-                elif state == ScreenState.SCREEN_LOCATION_POPUP:
-                    self._handle_screen_location_popup(info)
-                elif state == ScreenState.SCREEN_NUSUK_HOME:
-                    self._handle_screen_nusuk_home(info)
-                elif state == ScreenState.SCREEN_CHOOSE_DOOR:
-                    self._handle_screen_choose_door(info)
-                elif state == ScreenState.SCREEN_DOOR_CONFIRM_POPUP:
-                    self._handle_screen_door_confirm_popup(info)
-                elif state == ScreenState.SCREEN_QUIZ_QUESTION:
-                    self._handle_screen_quiz_question(info)
-                elif state == ScreenState.SCREEN_QUIZ_RESULT:
-                    self._handle_screen_quiz_result(info)
-                elif state == ScreenState.SCREEN_REDEEM_KEYS:
-                    self._handle_screen_redeem_keys(info)
-                elif state == ScreenState.SCREEN_REDEEM_SUCCESS:
-                    self._handle_screen_redeem_success(info)
-                elif state == ScreenState.SCREEN_UNKNOWN_OR_LOADING:
-                    self._check_still_online(force=False)  # OFFLINE != app error: no recovery, no circuit breaker
-                    if self.unknown_first_seen_time is None:
-                        self.unknown_first_seen_time = time.time()
-                    elapsed_unknown = time.time() - self.unknown_first_seen_time
-                    timeout_limit = max(20, settings.loading_timeout_seconds)
-                    self.update_telemetry_status(f"Waiting / Screen loading ({int(elapsed_unknown)}s / {timeout_limit}s)...")
-                    if elapsed_unknown >= timeout_limit:
-                        self._execute_auto_recovery(
-                            f"Screen unknown or loading timeout exceeded ({int(elapsed_unknown)}s >= {timeout_limit}s)")
-                        self.unknown_first_seen_time = None
+                try:
+                    if self._prefetched_info is not None:
+                        info = self._prefetched_info
+                        self._prefetched_info = None
                     else:
-                        self._sleep(0.4)
+                        info = self._inspect_screen()
+                    state = info["state"]
 
-                # Optional user-configured throttle (0.0 = full Smart Wait speed)
-                if settings.action_delay_seconds > 0:
-                    self._sleep(settings.action_delay_seconds)
+                    if state == ScreenState.SCREEN_UNKNOWN_OR_LOADING and not self.d:
+                        self._check_still_online(force=True)
+
+                    if state != ScreenState.SCREEN_UNKNOWN_OR_LOADING:
+                        self.consecutive_unknown_count = 0
+                        self.consecutive_recoveries = 0
+                        self.unknown_first_seen_time = None
+
+                    # Successful step clears consecutive transport retries
+                    transport_retries = 0
+
+                    # Confirm LOGGED_IN whenever worker reaches any authenticated screen
+                    if state in AUTHENTICATED_STATES:
+                        rt = instance_manager.rt(self.uuid)
+                        if rt.login_status != LoginStatus.LOGGED_IN or rt.login_error:
+                            self._login_alert_sent_state = None
+                            self._set_login_state(LoginStatus.LOGGED_IN, clear_error=True)
+
+                    if state == ScreenState.SCREEN_SYSTEM_DIALOG:
+                        self._handle_screen_system_dialog(info)
+                    elif state == ScreenState.SCREEN_LAUNCHER_OR_CLOSED:
+                        self._execute_auto_recovery("Nusuk app was closed or crashed")
+                    elif state == ScreenState.SCREEN_WELCOME_SLIDES:
+                        self._handle_screen_welcome_slides(info)
+                    elif state in (
+                        ScreenState.SCREEN_LOGIN_MAIN,
+                        ScreenState.SCREEN_LOGIN_METHOD_POPUP,
+                        ScreenState.SCREEN_LOGGED_OUT_TIMED_OUT,
+                        ScreenState.SCREEN_CREDENTIALS_FORM,
+                    ):
+                        self._handle_screen_awaiting_credentials(info)
+                    elif state == ScreenState.SCREEN_VERIFY_OTP_FORM:
+                        self._handle_screen_verify_otp(info)
+                    elif state == ScreenState.SCREEN_DAILY_LIMIT_POPUP:
+                        self._handle_screen_daily_limit_popup(info)
+                    elif state == ScreenState.SCREEN_LOCATION_POPUP:
+                        self._handle_screen_location_popup(info)
+                    elif state == ScreenState.SCREEN_NUSUK_HOME:
+                        self._handle_screen_nusuk_home(info)
+                    elif state == ScreenState.SCREEN_CHOOSE_DOOR:
+                        self._handle_screen_choose_door(info)
+                    elif state == ScreenState.SCREEN_DOOR_CONFIRM_POPUP:
+                        self._handle_screen_door_confirm_popup(info)
+                    elif state == ScreenState.SCREEN_QUIZ_QUESTION:
+                        self._handle_screen_quiz_question(info)
+                    elif state == ScreenState.SCREEN_QUIZ_RESULT:
+                        self._handle_screen_quiz_result(info)
+                    elif state == ScreenState.SCREEN_REDEEM_KEYS:
+                        self._handle_screen_redeem_keys(info)
+                    elif state == ScreenState.SCREEN_REDEEM_SUCCESS:
+                        self._handle_screen_redeem_success(info)
+                    elif state == ScreenState.SCREEN_UNKNOWN_OR_LOADING:
+                        self._check_still_online(force=False)  # OFFLINE != app error: no recovery, no circuit breaker
+                        if self.unknown_first_seen_time is None:
+                            self.unknown_first_seen_time = time.time()
+                        elapsed_unknown = time.time() - self.unknown_first_seen_time
+                        timeout_limit = max(20, settings.loading_timeout_seconds)
+                        self.update_telemetry_status(f"Waiting / Screen loading ({int(elapsed_unknown)}s / {timeout_limit}s)...")
+                        if elapsed_unknown >= timeout_limit:
+                            try:
+                                forensic_service.dump(
+                                    self.uuid, self.name,
+                                    category="screen_timeout",
+                                    reason=f"unknown_loading_{int(elapsed_unknown)}s",
+                                    xml_content=getattr(self, "_last_raw_xml", ""),
+                                )
+                            except Exception:
+                                pass
+                            self._execute_auto_recovery(
+                                f"Screen unknown or loading timeout exceeded ({int(elapsed_unknown)}s >= {timeout_limit}s)")
+                            self.unknown_first_seen_time = None
+                        else:
+                            self._sleep(0.4)
+
+                    # Optional user-configured throttle (0.0 = full Smart Wait speed)
+                    if settings.action_delay_seconds > 0:
+                        self._sleep(settings.action_delay_seconds)
+
+                except Exception as iter_err:
+                    if is_transport_or_socket_error(iter_err):
+                        transport_retries += 1
+                        self.log_system(
+                            LogSeverity.WARNING, "CONNECTION",
+                            f"Gangguan transport/socket ({iter_err.__class__.__name__}: {iter_err}) — auto-retry in-worker #{transport_retries}/3...",
+                        )
+                        self._safe_rollback_key()
+                        backoff = 1.5 * transport_retries
+                        if not self._sleep(backoff):
+                            break
+                        self.d = None
+                        ready = adb_manager.ensure_connected(self.device_id, retries=1, connection_type=self.connection_type)
+                        if ready and self.connect_device(retries=2):
+                            self.log_system(
+                                LogSeverity.INFO, "CONNECTION",
+                                f"Koneksi ADB/uiautomator2 berhasil dipulihkan in-worker pada percobaan #{transport_retries}. Melanjutkan tugas.",
+                            )
+                            transport_retries = 0
+                            continue
+                        if transport_retries >= 3:
+                            self.log_system(
+                                LogSeverity.WARNING, "CONNECTION",
+                                "Pemulihan transport in-worker gagal setelah 3 percobaan. Mengalihkan ke status OFFLINE untuk auto-reconnect background watchdog.",
+                            )
+                            went_offline = True
+                            break
+                    else:
+                        raise iter_err
 
         except DeviceOffline:
             went_offline = True
@@ -1992,11 +2167,14 @@ class InstanceWorker:
             # A crashed ADB link looks like an arbitrary exception; classify it before blaming the engine.
             tb_str = traceback.format_exc()
             logger.exception(f"Unexpected error in worker [{self.name}]: {e}\n{tb_str}")
-            try:
-                if not adb_manager.ensure_connected(self.device_id, retries=1, connection_type=self.connection_type):
-                    went_offline = True
-            except Exception:
+            if is_transport_or_socket_error(e):
                 went_offline = True
+            else:
+                try:
+                    if not adb_manager.ensure_connected(self.device_id, retries=1, connection_type=self.connection_type):
+                        went_offline = True
+                except Exception:
+                    went_offline = True
             if not went_offline:
                 self.log_system(LogSeverity.ERROR, "BOT_ENGINE", f"Unhandled engine exception: {e}\n{tb_str[:400]}")
                 self.final_status = self.final_status or "ERROR"

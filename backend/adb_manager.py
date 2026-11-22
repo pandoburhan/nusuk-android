@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import time
+import threading
 import logging
 from typing import Optional, Tuple, Dict, List, Any
 from backend.config import settings, PROJECT_ROOT, resolve_adb_binary
@@ -20,6 +21,45 @@ _TCP_SERIAL_RE = re.compile(r"^[^:\s]+:\d{1,5}$")
 _MDNS_ADDR_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})")
 
 
+def is_transport_or_socket_error(exc: Optional[BaseException]) -> bool:
+    """Classifies whether an exception is a transient network/socket/ADB/u2 transport error."""
+    if exc is None:
+        return False
+    exc_type = type(exc)
+    exc_type_name = exc_type.__name__
+    exc_module = exc_type.__module__ or ""
+
+    # 1. Standard socket / OS networking errors
+    if isinstance(exc, (ConnectionError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError, TimeoutError)):
+        return True
+
+    # 2. Check Windows / POSIX errno / winerror
+    winerror = getattr(exc, "winerror", None)
+    if winerror in (10048, 10053, 10054, 10055, 10060, 10061):
+        return True
+
+    # 3. Third-party library exceptions (adbutils, requests, urllib3, uiautomator2)
+    if "adbutils" in exc_module or "Adb" in exc_type_name:
+        return True
+    if "requests" in exc_module or "urllib3" in exc_module or "http" in exc_module:
+        return True
+    if "uiautomator2" in exc_module or "JsonRpcError" in exc_type_name or "GatewayError" in exc_type_name:
+        return True
+
+    # 4. Message keyword inspection
+    msg = str(exc).lower()
+    keywords = (
+        "10055", "10048", "10054", "10053", "10060", "10061",
+        "buffer space", "queue was full", "only one usage of each socket address",
+        "connect to adb server failed", "connection reset", "connection refused",
+        "connection aborted", "broken pipe", "remote end closed connection",
+        "device offline", "device not found", "timed out waiting for response",
+        "atx-agent", "atx agent", "jsonrpc", "json-rpc", "u2 server",
+        "target machine actively refused", "forcibly closed by the remote host",
+    )
+    return any(k in msg for k in keywords)
+
+
 class ADBManager:
     """
     Stateless, strictly per-target ADB wrapper.
@@ -30,6 +70,9 @@ class ADBManager:
     def __init__(self, adb_path: Optional[str] = None):
         self.adb_path = resolve_adb_binary(adb_path or settings.adb_path)
         os.environ["ADBUTILS_ADB_PATH"] = self.adb_path
+        self._screenshot_locks: Dict[str, threading.Lock] = {}
+        self._screenshot_cache: Dict[str, Tuple[float, bytes]] = {}
+        self._global_lock = threading.Lock()
 
     # ---------- low level ----------
     def run_adb(self, args: list, timeout: int = 15) -> Tuple[int, str, str]:
@@ -552,20 +595,49 @@ class ADBManager:
         )
 
     # ---------- screenshot (callers MUST check live_preview_enabled first) ----------
-    def take_screenshot_bytes(self, target: str) -> Optional[bytes]:
-        cmd = [self.adb_path, "-s", target, "exec-out", "screencap", "-p"]
+    def take_screenshot_bytes(self, target: str, max_age_sec: float = 0.5) -> Optional[bytes]:
+        with self._global_lock:
+            lock = self._screenshot_locks.get(target)
+            if lock is None:
+                lock = threading.Lock()
+                self._screenshot_locks[target] = lock
+
+        # Check recent cache first
+        now = time.monotonic()
+        cached = self._screenshot_cache.get(target)
+        if cached and (now - cached[0]) < max_age_sec:
+            return cached[1]
+
+        # Acquire per-target lock to prevent concurrent screencap processes for same target
+        acquired = lock.acquire(timeout=2.0)
+        if not acquired:
+            return cached[1] if cached else None
+
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            now = time.monotonic()
+            cached = self._screenshot_cache.get(target)
+            if cached and (now - cached[0]) < max_age_sec:
+                return cached[1]
+
+            cmd = [self.adb_path, "-s", target, "exec-out", "screencap", "-p"]
+            res = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             if res.returncode == 0 and len(res.stdout) > 1000:
                 raw = res.stdout
                 if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-                    return raw
-                if raw.startswith(b"\x89PNG\r\r\n"):
-                    return raw.replace(b"\r\r\n", b"\r\n")
-                return raw
+                    data = raw
+                elif raw.startswith(b"\x89PNG\r\r\n"):
+                    data = raw.replace(b"\r\r\n", b"\r\n")
+                else:
+                    data = raw
+                self._screenshot_cache[target] = (time.monotonic(), data)
+                return data
         except Exception as e:
             logger.debug(f"Screenshot capture failed for {target}: {e}")
+        finally:
+            lock.release()
         return None
 
 

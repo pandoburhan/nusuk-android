@@ -279,6 +279,11 @@ function FullscreenPreviewModal({ inst, previewSpeed, onChangePreviewSpeed, inte
                   {MODE_SHORT[inst.mode] || inst.mode}
                 </span>
               )}
+              {!inst.mode && inst.has_pending_task && (
+                <span className="text-[10px] px-2 py-0.5 rounded-md bg-amber-950/80 text-amber-300 border border-amber-800 font-mono" title="Tugas aktif tersimpan: otomatis dilanjutkan saat online">
+                  Auto-Resume: {MODE_SHORT[inst.pending_task_mode] || inst.pending_task_mode} ({inst.pending_task_completed || 0}/{inst.pending_task_stop_mode === 'until_exhausted' ? '∞' : (inst.pending_task_stop_limit || 100)})
+                </span>
+              )}
             </div>
             <div className="text-[11px] text-slate-400 font-mono truncate flex items-center gap-2 mt-0.5">
               <span>{inst.address}</span>
@@ -647,10 +652,23 @@ function DeviceCard({ inst, previewSpeed, intervalMs, patchInstance, toast, onEd
           Keys: <span className="text-emerald-400">{online ? (inst.current_app_keys ?? '—') : '—'}</span>
         </span>
         <span className="text-right">
-          {inst.mode ? <span className="text-sky-400">{MODE_SHORT[inst.mode] || inst.mode}</span> : '—'}
+          {inst.mode ? (
+            <span className="text-sky-400">{MODE_SHORT[inst.mode] || inst.mode}</span>
+          ) : inst.has_pending_task ? (
+            <span className="text-amber-400" title="Tugas aktif tersimpan: otomatis dilanjutkan saat online">
+              Auto-Resume ({MODE_SHORT[inst.pending_task_mode] || inst.pending_task_mode})
+            </span>
+          ) : (
+            '—'
+          )}
           {ONLINE.includes(inst.status) && (
             <span className="ml-1 text-emerald-400 font-mono font-medium">
               ({inst.session_completed_count ?? 0}/{inst.stop_mode === 'until_exhausted' ? '∞' : (inst.stop_limit || 100)})
+            </span>
+          )}
+          {!ONLINE.includes(inst.status) && inst.has_pending_task && (
+            <span className="ml-1 text-amber-300 font-mono font-medium">
+              ({inst.pending_task_completed || 0}/{inst.pending_task_stop_mode === 'until_exhausted' ? '∞' : (inst.pending_task_stop_limit || 100)})
             </span>
           )}
           {inst.status === 'RUNNING' && <span className="ml-1.5">⏱ {fmtUptime(inst.uptime_seconds)}</span>}

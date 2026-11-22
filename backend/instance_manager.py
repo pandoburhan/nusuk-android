@@ -5,6 +5,7 @@ via on-device UUID anchor) and the watchdog that silently reconnects OFFLINE dev
 """
 import datetime
 import ipaddress
+import json
 import logging
 import re
 import threading
@@ -16,7 +17,7 @@ from sqlalchemy import text
 
 from backend.config import settings
 from backend.database import SessionLocal
-from backend.models import Instance, LogSeverity, new_uuid
+from backend.models import Instance, LogSeverity, BotSetting, new_uuid
 from backend.adb_manager import adb_manager
 from backend.event_log import log_event, set_device_name
 from backend.telemetry import telemetry_manager
@@ -27,6 +28,38 @@ logger = logging.getLogger(__name__)
 ONLINE_STATES = ("IDLE", "RUNNING", "RECOVERING", "STOPPING", "ERROR")
 VALID_CONN_TYPES = ("tcp", "usb", "wireless")
 _SERIAL_SAFE_RE = re.compile(r"^[A-Za-z0-9._:@/-]{2,120}$")
+
+
+class TaskIntent:
+    """Persistent desired task intent for an instance."""
+    def __init__(
+        self,
+        mode: str,
+        stop_mode: str = "limit",
+        stop_limit: int = 100,
+        completed_count: int = 0,
+    ):
+        self.mode = mode
+        self.stop_mode = stop_mode or "limit"
+        self.stop_limit = max(1, int(stop_limit or 100))
+        self.completed_count = max(0, int(completed_count or 0))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "stop_mode": self.stop_mode,
+            "stop_limit": self.stop_limit,
+            "completed_count": self.completed_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TaskIntent":
+        return cls(
+            mode=data.get("mode", "auto"),
+            stop_mode=data.get("stop_mode", "limit"),
+            stop_limit=data.get("stop_limit", 100),
+            completed_count=data.get("completed_count", 0),
+        )
 
 
 class LoginStatus:
@@ -57,6 +90,7 @@ class Runtime:
         self.stop_mode: str = "limit"
         self.stop_limit: int = 100
         self.session_completed_count: int = 0
+        self.task_intent: Optional[TaskIntent] = None
         # Auto-Login state & thread-safe operator handoff (in-memory only, never persisted)
         self.login_status: str = LoginStatus.LOGGED_IN
         self.login_error: Optional[str] = None
@@ -72,7 +106,7 @@ class InstanceManager:
         self.runtime: Dict[str, Runtime] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._probe_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
+        self._probe_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="probe")
 
     # ------------------------------------------------------------------ runtime state
     def rt(self, device_uuid: str) -> Runtime:
@@ -94,6 +128,7 @@ class InstanceManager:
     def status_payload(self, device_uuid: str) -> Dict[str, Any]:
         r = self.rt(device_uuid)
         uptime = int(time.time() - r.start_time) if r.start_time and r.status in ("RUNNING", "RECOVERING", "STOPPING") else 0
+        ti = getattr(r, "task_intent", None)
         return {
             "device_uuid": device_uuid, "status": r.status, "mode": r.mode,
             "current_screen": r.current_screen, "current_step": r.current_step,
@@ -103,6 +138,11 @@ class InstanceManager:
             "session_completed_count": getattr(r, "session_completed_count", 0),
             "login_status": getattr(r, "login_status", LoginStatus.LOGGED_IN),
             "login_error": getattr(r, "login_error", None),
+            "has_pending_task": bool(ti),
+            "pending_task_mode": ti.mode if ti else None,
+            "pending_task_stop_mode": ti.stop_mode if ti else None,
+            "pending_task_stop_limit": ti.stop_limit if ti else None,
+            "pending_task_completed": ti.completed_count if ti else 0,
         }
 
     def emit_status(self, device_uuid: str):
@@ -163,13 +203,115 @@ class InstanceManager:
         self.clear_login_inputs(device_uuid)
         r = self.rt(device_uuid)
         first = not r.offline_logged
+        ti = getattr(r, "task_intent", None)
+        step_msg = (
+            f"Perangkat offline — tugas '{ti.mode}' ({ti.completed_count}/{ti.stop_limit}) akan otomatis dilanjutkan saat terhubung..."
+            if ti
+            else "Perangkat offline - mencoba menyambung ulang di latar belakang..."
+        )
         self.set_runtime(device_uuid, status="OFFLINE", mode=None, start_time=None,
-                         current_step="Perangkat offline - mencoba menyambung ulang di latar belakang...",
+                         current_step=step_msg,
                          offline_logged=True, next_probe_at=0.0, fail_count=0)
         if first:
             log_event(LogSeverity.WARNING, "CONNECTION",
                       f"Instance [{self.name_of(device_uuid)}] {reason} - status diubah ke OFFLINE. "
                       f"Mencoba menyambung ulang di latar belakang...", device_uuid)
+
+    # ------------------------------------------------------------------ persistent task intent
+    def set_task_intent(
+        self,
+        device_uuid: str,
+        mode: str,
+        stop_mode: str = "limit",
+        stop_limit: int = 100,
+        completed_count: int = 0,
+    ) -> TaskIntent:
+        intent = TaskIntent(mode=mode, stop_mode=stop_mode, stop_limit=stop_limit, completed_count=completed_count)
+        with self._lock:
+            r = self.rt(device_uuid)
+            r.task_intent = intent
+            r.stop_mode = intent.stop_mode
+            r.stop_limit = intent.stop_limit
+            r.session_completed_count = intent.completed_count
+        self._persist_task_intent(device_uuid, intent)
+        self.emit_status(device_uuid)
+        return intent
+
+    def get_task_intent(self, device_uuid: str) -> Optional[TaskIntent]:
+        with self._lock:
+            return getattr(self.rt(device_uuid), "task_intent", None)
+
+    def update_task_progress(self, device_uuid: str, completed_count: int):
+        intent = None
+        with self._lock:
+            r = self.rt(device_uuid)
+            if r.task_intent:
+                r.task_intent.completed_count = completed_count
+                intent = r.task_intent
+            r.session_completed_count = completed_count
+        if intent:
+            self._persist_task_intent(device_uuid, intent)
+        self.emit_status(device_uuid)
+
+    def clear_task_intent(self, device_uuid: str, reason: str = ""):
+        with self._lock:
+            r = self.rt(device_uuid)
+            r.task_intent = None
+        self._delete_task_intent(device_uuid)
+        self.emit_status(device_uuid)
+
+    def _persist_task_intent(self, device_uuid: str, intent: TaskIntent):
+        db = SessionLocal()
+        try:
+            k = f"task_intent:{device_uuid}"
+            val = json.dumps(intent.to_dict())
+            setting = db.query(BotSetting).filter(BotSetting.setting_key == k).first()
+            if setting:
+                setting.setting_value = val
+                setting.updated_at = utc_now_naive()
+            else:
+                db.add(BotSetting(setting_key=k, setting_value=val, updated_at=utc_now_naive()))
+            db.commit()
+        except Exception as e:
+            logger.debug(f"Failed to persist task intent for {device_uuid}: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    def _delete_task_intent(self, device_uuid: str):
+        db = SessionLocal()
+        try:
+            k = f"task_intent:{device_uuid}"
+            db.query(BotSetting).filter(BotSetting.setting_key == k).delete()
+            db.commit()
+        except Exception as e:
+            logger.debug(f"Failed to delete task intent for {device_uuid}: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    def _load_all_task_intents(self):
+        db = SessionLocal()
+        try:
+            settings_rows = db.query(BotSetting).filter(BotSetting.setting_key.like("task_intent:%")).all()
+            for s in settings_rows:
+                dev_uuid = s.setting_key.split("task_intent:", 1)[1]
+                if s.setting_value:
+                    try:
+                        d = json.loads(s.setting_value)
+                        intent = TaskIntent.from_dict(d)
+                        with self._lock:
+                            r = self.rt(dev_uuid)
+                            r.task_intent = intent
+                            r.stop_mode = intent.stop_mode
+                            r.stop_limit = intent.stop_limit
+                            r.session_completed_count = intent.completed_count
+                    except Exception as err:
+                        logger.warning(f"Failed to parse task intent for {dev_uuid}: {err}")
+        except Exception as e:
+            logger.debug(f"Failed to load task intents: {e}")
+        finally:
+            db.close()
 
     def name_of(self, device_uuid: str) -> str:
         from backend.event_log import device_name
@@ -250,6 +392,7 @@ class InstanceManager:
             set_device_name(inst.uuid, inst.name)
             with self._lock:
                 self.runtime[inst.uuid] = Runtime(last_app_keys=inst.last_app_keys)
+        self._load_all_task_intents()
 
     def start_watchdog(self):
         if self._thread and self._thread.is_alive():
@@ -776,6 +919,10 @@ class InstanceManager:
         log_event(LogSeverity.INFO, "CONNECTION",
                   f"Instance [{self.name_of(device_uuid)}] kembali ONLINE dan siap digunakan", device_uuid)
         self.emit_device_list()
+        r = self.rt(device_uuid)
+        if getattr(r, "task_intent", None) and installed:
+            from backend.orchestrator import orchestrator
+            self._probe_pool.submit(orchestrator.trigger_auto_resume, device_uuid)
         return True
 
     def reconnect_now(self, device_uuid: str) -> bool:
@@ -785,8 +932,13 @@ class InstanceManager:
         ct = (inst.connection_type or "tcp").lower()
         if adb_manager.ensure_connected(inst.address, connection_type=ct):
             st = self.rt(device_uuid).status
-            if st in ("OFFLINE", "ERROR"):
+            if st in ("OFFLINE", "ERROR", "REBOOTING"):
                 return self.come_online(device_uuid, inst.address, inst.is_legacy_primary)
+            else:
+                r = self.rt(device_uuid)
+                if getattr(r, "task_intent", None) and st == "IDLE":
+                    from backend.orchestrator import orchestrator
+                    self._probe_pool.submit(orchestrator.trigger_auto_resume, device_uuid)
             return True
         self.set_runtime(device_uuid, next_probe_at=0.0)
         return False

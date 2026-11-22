@@ -288,7 +288,7 @@ def get_instance_screenshot(device_uuid: str):
         raise HTTPException(status_code=409, detail="preview_disabled")
 
     rt = instance_manager.rt(device_uuid)
-    if rt.status in ("OFFLINE", "REBOOTING"):
+    if rt.status in ("OFFLINE", "REBOOTING", "RECOVERING") or orchestrator.is_switching(device_uuid):
         raise HTTPException(status_code=503, detail=f"Perangkat sedang {rt.status}")
 
     raw_bytes = adb_manager.take_screenshot_bytes(inst.address)

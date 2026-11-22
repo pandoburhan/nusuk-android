@@ -43,6 +43,68 @@ class Orchestrator:
         w = self.workers.get(device_uuid)
         return bool(w and w.is_running)
 
+    def trigger_auto_resume(self, device_uuid: str) -> bool:
+        """
+        Auto-resumes a pending task intent on `device_uuid` after reconnect, reboot,
+        app restart, or recoverable transient offline/error.
+        """
+        intent = instance_manager.get_task_intent(device_uuid)
+        if not intent:
+            return False
+
+        dev_lock = self._dev_lock(device_uuid)
+        if not dev_lock.acquire(blocking=False):
+            logger.debug(f"Auto-Resume skipped for {device_uuid}: device lock busy")
+            return False
+
+        try:
+            w = self.workers.get(device_uuid)
+            if w and w.is_running:
+                return True
+
+            inst = instance_manager.get_instance(device_uuid)
+            if not inst:
+                return False
+
+            rt = instance_manager.rt(device_uuid)
+            if rt.status in ("REBOOTING", "STOPPING", "OFFLINE"):
+                return False
+
+            # Prerequisites validation
+            if intent.mode in AI_MODES and not settings.ai_api_key:
+                log_event(LogSeverity.ERROR, "BOT_CONTROL",
+                          f"Auto-Resume tertunda: AI API Key belum dikonfigurasi untuk mode '{intent.mode}'.", device_uuid)
+                return False
+
+            fail_reason = self._validate_target_mode_for_device(inst, intent.mode)
+            if fail_reason:
+                log_event(LogSeverity.WARNING, "BOT_CONTROL",
+                          f"Auto-Resume tertunda: {fail_reason}.", device_uuid)
+                return False
+
+            new_worker = InstanceWorker(inst)
+            with self._lock:
+                self.workers[device_uuid] = new_worker
+
+            ok = new_worker.start(
+                intent.mode,
+                stop_mode=intent.stop_mode,
+                stop_limit=intent.stop_limit,
+                initial_completed=intent.completed_count,
+            )
+            if ok:
+                log_event(
+                    LogSeverity.INFO,
+                    "BOT_CONTROL",
+                    f"Auto-Resume berhasil: melanjutkan tugas '{intent.mode}' "
+                    f"(progres: {intent.completed_count}/{intent.stop_limit}).",
+                    device_uuid,
+                )
+                return True
+            return False
+        finally:
+            dev_lock.release()
+
     def is_switching(self, device_uuid: str) -> bool:
         with self._lock:
             return device_uuid in self._switching
@@ -145,6 +207,10 @@ class Orchestrator:
                     if current_mode == mode:
                         if w and w.is_running:
                             w.update_stop_condition(dev_stop_mode, dev_stop_limit)
+                        instance_manager.set_task_intent(
+                            uid, mode, dev_stop_mode, dev_stop_limit,
+                            completed_count=(w.session_completed_count if w else rt.session_completed_count),
+                        )
                         already_running.append({**self._ref(inst), "mode": mode, "stop_mode": dev_stop_mode, "stop_limit": dev_stop_limit})
                         continue
 
@@ -162,6 +228,9 @@ class Orchestrator:
                         self._switching.add(uid)
                         self._switch_cancelled.discard(uid)
 
+                    instance_manager.set_task_intent(
+                        uid, mode, dev_stop_mode, dev_stop_limit, completed_count=0
+                    )
                     instance_manager.set_runtime(
                         uid,
                         status="STOPPING",
@@ -181,6 +250,9 @@ class Orchestrator:
                     skipped.append({**self._ref(inst), "reason": fail_reason})
                     continue
 
+                instance_manager.set_task_intent(
+                    uid, mode, dev_stop_mode, dev_stop_limit, completed_count=0
+                )
                 if rt.status == "ERROR":
                     instance_manager.set_runtime(uid, status="IDLE", emit=False)
                 worker = InstanceWorker(inst)
@@ -189,6 +261,7 @@ class Orchestrator:
                 if worker.start(mode, stop_mode=dev_stop_mode, stop_limit=dev_stop_limit):
                     started.append(self._ref(inst))
                 else:
+                    instance_manager.clear_task_intent(uid, "Gagal memulai worker")
                     skipped.append({**self._ref(inst), "reason": "Gagal memulai worker"})
             finally:
                 dev_lock.release()
@@ -303,6 +376,9 @@ class Orchestrator:
                 skipped.append({"uuid": uid, "name": uid[:8], "reason": "Instance tidak ditemukan"})
                 continue
 
+            # Clear task intent so this device will not auto-resume
+            instance_manager.clear_task_intent(uid, reason=reason)
+
             switching = self.is_switching(uid)
             if switching:
                 with self._lock:
@@ -346,7 +422,18 @@ class Orchestrator:
                 return False, "OFFLINE"
             log_event(LogSeverity.INFO, "BOT_CONTROL", "Force Restart App (Nusuk) dipicu operator", device_uuid)
             adb_manager.clear_ram(inst.address)
+            try:
+                adb_manager.shell(inst.address, "settings put global development_settings_enabled 0", timeout=5)
+            except Exception:
+                pass
             adb_manager.launch_app(inst.address)
+
+            # Check if this instance has a pending task intent to automatically resume!
+            ti = instance_manager.get_task_intent(device_uuid)
+            if ti:
+                self.trigger_auto_resume(device_uuid)
+                return True, f"Aplikasi Nusuk di-restart — tugas '{ti.mode}' otomatis dilanjutkan"
+
             instance_manager.set_runtime(device_uuid, status="IDLE", mode=None, current_step="Aplikasi Nusuk di-restart")
             return True, "Aplikasi Nusuk di-restart"
 
@@ -404,6 +491,7 @@ class Orchestrator:
         with self._dev_lock(device_uuid):
             if not self._stop_and_wait(device_uuid, "Instance dihapus (soft-delete)", return_to_home=False):
                 raise TimeoutError("Worker belum berhenti; coba lagi sesaat lagi.")
+            instance_manager.clear_task_intent(device_uuid, reason="Instance dihapus")
             self.workers.pop(device_uuid, None)
             instance_manager.soft_delete(device_uuid)
 

@@ -431,6 +431,11 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
                           Progress: {progCount} / {progLimitStr} {progUnit}
                         </span>
                       )}
+                      {!isAct && i.has_pending_task && (
+                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-950/60 text-amber-300 border border-amber-800/50 font-mono shrink-0" title="Tugas aktif tersimpan: otomatis dilanjutkan saat terhubung kembali">
+                          Auto-Resume: {MODE_SHORT[i.pending_task_mode] || i.pending_task_mode} ({i.pending_task_completed || 0}/{i.pending_task_stop_mode === 'until_exhausted' ? '∞' : (i.pending_task_stop_limit || 100)})
+                        </span>
+                      )}
                     </div>
                     <div className="text-[10px] text-slate-500 font-mono flex items-center gap-2 mt-0.5">
                       <span>{i.address}</span>

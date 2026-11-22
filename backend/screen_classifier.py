@@ -22,6 +22,7 @@ class ScreenState:
     SCREEN_QUIZ_RESULT = "SCREEN_QUIZ_RESULT"
     SCREEN_REDEEM_KEYS = "SCREEN_REDEEM_KEYS"
     SCREEN_REDEEM_SUCCESS = "SCREEN_REDEEM_SUCCESS"
+    SCREEN_SYSTEM_DIALOG = "SCREEN_SYSTEM_DIALOG"
     SCREEN_UNKNOWN_OR_LOADING = "SCREEN_UNKNOWN_OR_LOADING"
 
 def normalize_text(text: Optional[str]) -> str:
@@ -70,7 +71,16 @@ def scale_ref_xy(ref_x: int, ref_y: int, screen_w: int = 720, screen_h: int = 12
     return max(1, int(round(ref_x * screen_w / 720.0))), max(1, int(round(ref_y * screen_h / 1280.0)))
 
 _IME_PACKAGE_HINTS = ("inputmethod", "keyboard", "gboard", "latinime", "swiftkey", "ime")
-_SYSTEM_CRASH_PHRASES = ("keeps stopping", "isn't responding", "has stopped", "app isn't responding")
+_SYSTEM_ANR_PHRASES = (
+    "isn't responding", "is not responding", "not responding", "app isn't responding",
+    "tidak menanggapi", "tidak merespon", "tidak menjawab", "la yastajib",
+)
+_SYSTEM_CRASH_PHRASES = (
+    "keeps stopping", "has stopped", "stopped unexpectedly", "unfortunately,",
+    "telah berhenti", "terus berhenti", "terhenti",
+    "force close", "tutup paksa",
+)
+_ALL_SYSTEM_DIALOG_PHRASES = _SYSTEM_ANR_PHRASES + _SYSTEM_CRASH_PHRASES
 
 class ScreenClassifier:
     """
@@ -106,6 +116,7 @@ class ScreenClassifier:
             "has_nusuk_package": False,
             "has_ime_overlay": False,
             "has_system_crash_dialog": False,
+            "system_dialog_data": None,  # {"dialog_target": str, "is_anr": bool, "is_crash": bool, "title": str, "message": str, "wait_bounds": tuple|None, "close_bounds": tuple|None, "restart_bounds": tuple|None, "ok_bounds": tuple|None, "all_button_bounds": list}
             "all_texts": []
         }
 
@@ -190,9 +201,96 @@ class ScreenClassifier:
 
         combined_text = " ".join([n["norm_text"] + " " + n["norm_desc"] for n in all_nodes])
 
-        # Detect Android crash / ANR dialog overlay (e.g. "Nusuk keeps stopping")
-        if any(phrase in combined_text for phrase in _SYSTEM_CRASH_PHRASES):
+        # Detect Android system crash / ANR / warning dialogs across emulators & physical devices
+        has_dialog_phrase = any(phrase in combined_text for phrase in _ALL_SYSTEM_DIALOG_PHRASES)
+        has_aerr_id = any("aerr_" in (n.get("resource_id") or "") for n in all_nodes)
+        has_alert_title = any(
+            "alertTitle" in (n.get("resource_id") or "")
+            and any(w in n["norm_text"] for w in ("responding", "menanggapi", "stopped", "berhenti", "stopping"))
+            for n in all_nodes
+        )
+
+        if has_dialog_phrase or has_aerr_id or has_alert_title:
             info["has_system_crash_dialog"] = True
+            info["state"] = ScreenState.SCREEN_SYSTEM_DIALOG
+
+            is_anr = (
+                any(p in combined_text for p in _SYSTEM_ANR_PHRASES)
+                or any("wait" in n["norm_text"] for n in all_nodes if "aerr" in (n.get("resource_id") or ""))
+            )
+            is_crash = (
+                any(p in combined_text for p in _SYSTEM_CRASH_PHRASES)
+                or any("close" in n["norm_text"] for n in all_nodes if "aerr" in (n.get("resource_id") or ""))
+            )
+
+            # Determine dialog target: app itself vs OS/system/launcher
+            dialog_target = "unknown"
+            if "nusuk" in combined_text:
+                dialog_target = "nusuk"
+            elif any(k in combined_text for k in ("memu", "launcher", "process system", "system ui", "system", "android")):
+                dialog_target = "system"
+
+            dialog_title = ""
+            dialog_message = ""
+            wait_bounds = None
+            close_bounds = None
+            restart_bounds = None
+            ok_bounds = None
+            all_btn_bounds = []
+
+            wait_labels = {"wait", "tunggu", "wait for app", "tunggu sebentar"}
+            close_labels = {"close app", "close", "tutup aplikasi", "tutup", "force close", "kill"}
+            restart_labels = {"restart app", "restart", "mulai ulang", "buka ulang", "open app again"}
+            ok_labels = {"ok", "oke", "got it", "mengerti", "paham"}
+
+            for n in all_nodes:
+                res_id = n.get("resource_id") or ""
+                nt = n["norm_text"]
+                nd = n["norm_desc"]
+                b = n.get("bounds")
+
+                if "alertTitle" in res_id or ("title" in res_id and ("responding" in nt or "stopping" in nt or "berhenti" in nt or "menanggapi" in nt)):
+                    dialog_title = n["text"] or n["desc"] or dialog_title
+                elif "message" in res_id or ("msg" in res_id and len(nt) > 10):
+                    dialog_message = n["text"] or n["desc"] or dialog_message
+
+                if not b:
+                    continue
+
+                # Identify action buttons by resource ID or text
+                if "aerr_wait" in res_id or nt in wait_labels or nd in wait_labels:
+                    wait_bounds = b
+                elif "aerr_close" in res_id or nt in close_labels or nd in close_labels:
+                    close_bounds = b
+                elif "aerr_restart" in res_id or nt in restart_labels or nd in restart_labels:
+                    restart_bounds = b
+                elif nt in ok_labels or nd in ok_labels:
+                    ok_bounds = b
+
+                if n.get("clickable") or "button" in (n.get("class") or "").lower():
+                    all_btn_bounds.append({"text": n["text"], "bounds": b, "res_id": res_id})
+
+            if not dialog_title:
+                for n in all_nodes:
+                    nt = n["norm_text"]
+                    if any(p in nt for p in _ALL_SYSTEM_DIALOG_PHRASES):
+                        dialog_title = n["text"]
+                        break
+            if not dialog_title:
+                dialog_title = "ANR / System Warning Dialog" if is_anr else "System Crash Dialog"
+
+            info["system_dialog_data"] = {
+                "dialog_target": dialog_target,
+                "is_anr": is_anr,
+                "is_crash": is_crash,
+                "title": dialog_title,
+                "message": dialog_message,
+                "wait_bounds": wait_bounds,
+                "close_bounds": close_bounds,
+                "restart_bounds": restart_bounds,
+                "ok_bounds": ok_bounds,
+                "all_button_bounds": all_btn_bounds,
+            }
             return info
 
         # 1. Check for current_app_keys in header (Top-right area proportional to screen size)
