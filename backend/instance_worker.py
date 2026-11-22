@@ -77,6 +77,7 @@ class InstanceWorker:
         self._return_to_home_on_stop = True
         self._for_switch = False
         self.final_status: Optional[str] = None  # IDLE (default) | ERROR | OFFLINE
+        self._stopped_reason: Optional[str] = None  # e.g. "DAILY_LIMIT", "LIMIT_REACHED", "EXHAUSTED"
 
         self.current_screen = ScreenState.SCREEN_UNKNOWN_OR_LOADING
         self.start_time: Optional[float] = None
@@ -284,6 +285,7 @@ class InstanceWorker:
             self._for_switch = False
             self.is_running = True
             self.final_status = None
+            self._stopped_reason = None
             self.start_time = time.time()
             self.consecutive_recoveries = 0
             self.consecutive_unknown_count = 0
@@ -692,6 +694,7 @@ class InstanceWorker:
                 self.update_telemetry_status(msg, bot_status="IDLE")
                 self._alert("info", msg)
                 instance_manager.clear_task_intent(self.uuid, "Target limit reached")
+                self._stopped_reason = "LIMIT_REACHED"
                 self._stop_requested = True
 
     def _record_quiz_log(self, door: str, question: str, options: List[str], chosen_ans: str, chosen_idx: int,
@@ -773,6 +776,7 @@ class InstanceWorker:
             self._alert("warning", f"Daily Limit Reached ({popup_msg}) — Bot dihentikan total. Coba lagi besok (reset 00:00 Arab Saudi).")
             self.update_telemetry_status(step_msg, bot_status="STOPPING")
             self.final_status = "IDLE"
+            self._stopped_reason = "DAILY_LIMIT"
             self._return_to_home_on_stop = True
             self._stop_requested = True
             self._stop_event.set()
@@ -1130,6 +1134,7 @@ class InstanceWorker:
                 self.update_telemetry_status(msg, bot_status="IDLE")
                 self._alert("info", msg)
                 instance_manager.clear_task_intent(self.uuid, "Target limit reached")
+                self._stopped_reason = "LIMIT_REACHED"
                 self._stop_requested = True
                 return
 
@@ -2217,3 +2222,9 @@ class InstanceWorker:
                         bot_status=final,
                     )
                     self.log_system(LogSeverity.INFO, "BOT_CONTROL", f"Bot execution finished and status set to {final}.")
+                    if final == "IDLE":
+                        try:
+                            from backend.orchestrator import orchestrator
+                            orchestrator._promote_next_queued_task(self.uuid, stopped_reason=self._stopped_reason)
+                        except Exception as promo_err:
+                            logger.error(f"Error promoting queued task for {self.uuid}: {promo_err}")

@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 MODES = ("answer_only", "redeem_only", "auto")
 AI_MODES = ("answer_only", "auto")
 ACTIVE_STATES = ("RUNNING", "RECOVERING")
+QUIZ_MODES = ("answer_only", "auto")  # modes that use daily-limited quiz system
 
 
 class Orchestrator:
@@ -228,6 +229,13 @@ class Orchestrator:
                         self._switching.add(uid)
                         self._switch_cancelled.discard(uid)
 
+                    # SWITCH clears the existing queue (operator explicitly chose a new immediate mode)
+                    q_len = len(instance_manager.get_queue(uid))
+                    if q_len > 0:
+                        instance_manager.clear_queue(uid)
+                        log_event(LogSeverity.INFO, "BOT_CONTROL",
+                                  f"Queue {q_len} item dihapus karena operator memilih mode baru via SWITCH.", uid)
+
                     instance_manager.set_task_intent(
                         uid, mode, dev_stop_mode, dev_stop_limit, completed_count=0
                     )
@@ -376,8 +384,9 @@ class Orchestrator:
                 skipped.append({"uuid": uid, "name": uid[:8], "reason": "Instance tidak ditemukan"})
                 continue
 
-            # Clear task intent so this device will not auto-resume
+            # Clear task intent AND queue so this device will not auto-resume or run any queued task
             instance_manager.clear_task_intent(uid, reason=reason)
+            instance_manager.clear_queue(uid)
 
             switching = self.is_switching(uid)
             if switching:
@@ -402,6 +411,203 @@ class Orchestrator:
             w.stop(reason, return_to_home=return_to_home)
             return w.join(timeout)
         return True
+
+    # ------------------------------------------------------------ queue management
+    def queue_many(
+        self,
+        device_uuids: List[str],
+        mode: str,
+        device_stop_conditions: Optional[Any] = None,
+        stop_mode: str = "limit",
+        stop_limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Enqueue a future task per device. Never interrupts the current running task."""
+        if mode not in MODES:
+            raise ValueError("Mode tidak valid. Gunakan answer_only, redeem_only, atau auto.")
+        if mode in AI_MODES and not settings.ai_api_key:
+            raise ValueError("Tidak dapat mengantrekan: AI API Key belum dikonfigurasi di Settings.")
+
+        # Normalize per-device stop conditions
+        cond_map: Dict = {}
+        if isinstance(device_stop_conditions, dict):
+            cond_map = device_stop_conditions
+        elif isinstance(device_stop_conditions, list):
+            for c in device_stop_conditions:
+                if isinstance(c, dict) and "device_uuid" in c:
+                    cond_map[c["device_uuid"]] = c
+
+        queued, skipped = [], []
+
+        for uid in dict.fromkeys(device_uuids):
+            inst = instance_manager.get_instance(uid)
+            if not inst:
+                skipped.append({"uuid": uid, "name": uid[:8], "reason": "Instance tidak ditemukan / sudah dihapus"})
+                continue
+
+            u_cond = cond_map.get(uid) or {}
+            dev_stop_mode = (u_cond.get("stop_mode") if isinstance(u_cond, dict) else getattr(u_cond, "stop_mode", None)) or stop_mode or "limit"
+            dev_stop_limit = (u_cond.get("stop_limit") if isinstance(u_cond, dict) else getattr(u_cond, "stop_limit", None)) or stop_limit or 100
+            try:
+                dev_stop_limit = int(dev_stop_limit)
+                if dev_stop_limit < 1:
+                    dev_stop_limit = 100
+            except (ValueError, TypeError):
+                dev_stop_limit = 100
+
+            rt = instance_manager.rt(uid)
+            w = self.workers.get(uid)
+            worker_active = bool(w and w.is_running) or rt.status in ACTIVE_STATES
+
+            if not worker_active:
+                skipped.append({**self._ref(inst), "reason": "Device belum berjalan; gunakan START untuk memulai tugas"})
+                continue
+
+            if rt.status in ("STOPPING", "REBOOTING"):
+                skipped.append({**self._ref(inst), "reason": f"Device sedang {rt.status}"})
+                continue
+
+            # Determine current effective mode (from running worker or last queue item)
+            current_mode = (w.active_mode if w and w.is_running else rt.mode)
+            tq = instance_manager.get_queue(uid)
+            last_queued_mode = tq[-1]["mode"] if tq else None
+            effective_last_mode = last_queued_mode or current_mode
+
+            if effective_last_mode == mode:
+                skipped.append({
+                    **self._ref(inst),
+                    "reason": f"Mode '{mode}' sudah sama dengan mode aktif/antrian terakhir; gunakan START/SWITCH untuk mengubah parameter stop condition"
+                })
+                continue
+
+            # Validate prerequisites
+            fail_reason = self._validate_target_mode_for_device(inst, mode)
+            if fail_reason and mode != "redeem_only":
+                # For redeem_only, re-validate at promotion time (stock may change)
+                skipped.append({**self._ref(inst), "reason": f"Prasyarat tidak terpenuhi: {fail_reason}"})
+                continue
+
+            item = instance_manager.enqueue_task(uid, mode, dev_stop_mode, dev_stop_limit)
+            log_event(
+                LogSeverity.INFO, "BOT_CONTROL",
+                f"Tugas '{mode}' ditambahkan ke antrian (posisi #{len(tq)+1}) — tugas yang berjalan tidak terganggu.",
+                uid,
+            )
+            queued.append({**self._ref(inst), "mode": mode, "queue_id": item["queue_id"], "queue_position": len(tq) + 1})
+
+        parts = []
+        if queued:
+            parts.append(f"{len(queued)} diantrekan")
+        if skipped:
+            parts.append(f"{len(skipped)} dilewati")
+        msg = ", ".join(parts) if parts else "Tidak ada device yang diproses"
+        if skipped:
+            msg += " (" + "; ".join(f"{s['name']}: {s['reason']}" for s in skipped[:5]) + ")"
+
+        return {
+            "success": bool(queued) or not skipped,
+            "message": msg,
+            "queued": queued,
+            "skipped": skipped,
+        }
+
+    def cancel_queue(self, device_uuid: str, queue_id: Optional[str] = None) -> Dict[str, Any]:
+        """Cancel a specific queue item or all queued tasks for the device."""
+        inst = instance_manager.get_instance(device_uuid)
+        if not inst:
+            return {"success": False, "message": "Instance tidak ditemukan"}
+
+        if queue_id:
+            removed = instance_manager.cancel_queue_item(device_uuid, queue_id)
+            if removed:
+                log_event(LogSeverity.INFO, "BOT_CONTROL", f"Item antrian ({queue_id[:8]}) dibatalkan operator.", device_uuid)
+                return {"success": True, "message": f"Item antrian dihapus."}
+            else:
+                return {"success": False, "message": f"Item antrian tidak ditemukan (queue_id={queue_id})."}
+        else:
+            q_len = len(instance_manager.get_queue(device_uuid))
+            instance_manager.clear_queue(device_uuid)
+            log_event(LogSeverity.INFO, "BOT_CONTROL", f"Seluruh antrian ({q_len} item) dibatalkan operator.", device_uuid)
+            return {"success": True, "message": f"Seluruh antrian ({q_len} item) dihapus."}
+
+    def _promote_next_queued_task(self, device_uuid: str, stopped_reason: Optional[str] = None):
+        """
+        Called after a worker finishes naturally. Dequeues and starts the next queued task
+        if prerequisites are still met. Skips quiz-based tasks when daily limit was hit.
+        """
+        tq = instance_manager.get_queue(device_uuid)
+        if not tq:
+            return
+
+        # Daily Limit guard: if the task stopped due to daily limit, skip quiz-mode queued tasks
+        while True:
+            item = instance_manager.dequeue_next_task(device_uuid)
+            if item is None:
+                break
+
+            next_mode = item["mode"]
+            inst = instance_manager.get_instance(device_uuid)
+            if not inst:
+                break
+
+            if stopped_reason == "DAILY_LIMIT" and next_mode in QUIZ_MODES:
+                log_event(
+                    LogSeverity.WARNING, "BOT_CONTROL",
+                    f"Antrian mode '{next_mode}' dilewati: daily limit sudah tercapai hari ini untuk mode quiz.",
+                    device_uuid,
+                )
+                from backend.telemetry import telemetry_manager
+                telemetry_manager.emit_sync("alert_event", {
+                    "device_uuid": device_uuid,
+                    "type": "warning",
+                    "message": f"[{inst.name}] Antrian mode '{next_mode}' dilewati karena Daily Limit sudah tercapai hari ini.",
+                })
+                continue  # try next in queue
+
+            # Validate prerequisites at promotion time
+            if next_mode in AI_MODES and not settings.ai_api_key:
+                log_event(LogSeverity.WARNING, "BOT_CONTROL",
+                          f"Antrian mode '{next_mode}' dilewati: AI API Key belum dikonfigurasi.", device_uuid)
+                continue
+
+            fail_reason = self._validate_target_mode_for_device(inst, next_mode)
+            if fail_reason:
+                log_event(LogSeverity.WARNING, "BOT_CONTROL",
+                          f"Antrian mode '{next_mode}' dilewati: {fail_reason}.", device_uuid)
+                continue
+
+            rt = instance_manager.rt(device_uuid)
+            if rt.status not in ("IDLE", "ERROR"):
+                log_event(LogSeverity.WARNING, "BOT_CONTROL",
+                          f"Antrian mode '{next_mode}' tidak dapat dipromosikan: status device '{rt.status}'.", device_uuid)
+                # Put item back at front of queue
+                with instance_manager._lock:
+                    r = instance_manager.rt(device_uuid)
+                    r.task_queue.insert(0, item)
+                instance_manager._persist_task_queue(device_uuid, instance_manager.get_queue(device_uuid))
+                break
+
+            # Set task intent and start new worker
+            instance_manager.set_task_intent(
+                device_uuid, next_mode, item["stop_mode"], item["stop_limit"], completed_count=0
+            )
+            if rt.status == "ERROR":
+                instance_manager.set_runtime(device_uuid, status="IDLE", emit=False)
+
+            new_worker = InstanceWorker(inst)
+            with self._lock:
+                self.workers[device_uuid] = new_worker
+
+            if new_worker.start(next_mode, stop_mode=item["stop_mode"], stop_limit=item["stop_limit"]):
+                log_event(
+                    LogSeverity.INFO, "BOT_CONTROL",
+                    f"Antrian dipromosikan: mode '{next_mode}' otomatis dimulai setelah tugas sebelumnya selesai.",
+                    device_uuid,
+                )
+            else:
+                instance_manager.clear_task_intent(device_uuid, "Gagal memulai worker dari antrian")
+                log_event(LogSeverity.ERROR, "BOT_CONTROL",
+                          f"Gagal memulai worker untuk antrian mode '{next_mode}'.", device_uuid)
+            break  # only promote one task at a time
 
     # ------------------------------------------------------------ restarts
     def force_restart_app(self, device_uuid: str) -> Tuple[bool, str]:
@@ -492,6 +698,7 @@ class Orchestrator:
             if not self._stop_and_wait(device_uuid, "Instance dihapus (soft-delete)", return_to_home=False):
                 raise TimeoutError("Worker belum berhenti; coba lagi sesaat lagi.")
             instance_manager.clear_task_intent(device_uuid, reason="Instance dihapus")
+            instance_manager.clear_queue(device_uuid)
             self.workers.pop(device_uuid, None)
             instance_manager.soft_delete(device_uuid)
 

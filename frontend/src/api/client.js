@@ -74,6 +74,11 @@ export const instancesApi = {
   start: (uuid, mode, stop_mode = 'limit', stop_limit = 100) =>
     api.post(`/instances/${uuid}/start`, { mode, stop_mode, stop_limit }),
   stop: (uuid) => api.post(`/instances/${uuid}/stop`),
+  addToQueue: (uuid, mode, stop_mode = 'limit', stop_limit = 100) =>
+    api.post(`/instances/${uuid}/queue`, { mode, stop_mode, stop_limit }),
+  cancelQueue: (uuid, queueId = null) =>
+    api.delete(`/instances/${uuid}/queue${queueId ? `?queue_id=${encodeURIComponent(queueId)}` : ''}`),
+  getQueue: (uuid) => api.get(`/instances/${uuid}/queue`),
   forceRestartApp: (uuid) => api.post(`/instances/${uuid}/force-restart-app`),
   forceRestartDevice: (uuid) => api.post(`/instances/${uuid}/force-restart-device`),
   reconnect: (uuid) => api.post(`/instances/${uuid}/reconnect`),
@@ -96,6 +101,9 @@ export const controlApi = {
   bulkStart: (device_uuids, mode, device_stop_conditions = null, stop_mode = 'limit', stop_limit = 100) =>
     api.post('/control/bulk/start', { device_uuids, mode, device_stop_conditions, stop_mode, stop_limit }),
   bulkStop: (device_uuids) => api.post('/control/bulk/stop', { device_uuids }),
+  bulkQueue: (device_uuids, mode, device_stop_conditions = null, stop_mode = 'limit', stop_limit = 100) =>
+    api.post('/control/bulk/queue', { device_uuids, mode, device_stop_conditions, stop_mode, stop_limit }),
+  bulkCancelQueue: (device_uuids) => api.post('/control/bulk/cancel-queue', { device_uuids }),
   bulkForceRestart: (device_uuids, kind) =>
     api.post('/control/bulk/force-restart', { device_uuids, kind }),
   reconnectAll: () => api.post('/control/reconnect-all'),

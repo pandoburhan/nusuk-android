@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { Play, Square, RotateCcw, Bot, Plus, Power, Smartphone, ArrowRightLeft, AlertTriangle, Sliders, Check, LogIn, KeyRound, Loader2 } from 'lucide-react';
-import { controlApi, errorDetail } from '../api/client';
+import { Play, Square, RotateCcw, Bot, Plus, Power, Smartphone, ArrowRightLeft, AlertTriangle, Sliders, Check, LogIn, KeyRound, Loader2, ListPlus, Clock, X } from 'lucide-react';
+import { controlApi, instancesApi, errorDetail } from '../api/client';
 import { ONLINE, StatusBadge, ConnectionBadge, ConfirmModal } from './common';
 
 const ACTIVE_RUN = new Set(['RUNNING', 'RECOVERING']);
@@ -114,8 +114,9 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
     const started = d.started || [];
     const switched = d.switched || [];
     const already = d.already_running || [];
+    const queued = d.queued || [];
     const skipped = d.skipped || [];
-    const okCount = started.length + switched.length + already.length;
+    const okCount = started.length + switched.length + already.length + queued.length;
     const type = okCount === 0 ? 'error' : skipped.length > 0 || warningNotices.length > 0 ? 'warning' : 'success';
     const lines = [];
     if (started.length > 0 && title.startsWith('START')) {
@@ -124,6 +125,11 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
     if (switched.length > 0) {
       lines.push(
         `Switch mode (${switched.length}): ${switched.map((x) => `${x.name} (${x.from_mode || '?'} → ${x.to_mode})`).join(', ')}`,
+      );
+    }
+    if (queued.length > 0) {
+      lines.push(
+        `Diantrekan (${queued.length}): ${queued.map((x) => `${x.name} (antrian #${x.queue_position || '?'}: ${x.mode})`).join(', ')}`,
       );
     }
     if (already.length > 0) {
@@ -138,9 +144,9 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
     toast({
       type,
       title,
-      message: d.message || `${started.length} berhasil${skipped.length ? `, ${skipped.length} dilewati` : ''}.`,
+      message: d.message || `${started.length + queued.length} berhasil${skipped.length ? `, ${skipped.length} dilewati` : ''}.`,
       lines,
-      sticky: skipped.length > 0 || switched.length > 0 || warningNotices.length > 0,
+      sticky: skipped.length > 0 || switched.length > 0 || queued.length > 0 || warningNotices.length > 0,
     });
   };
 
@@ -202,6 +208,73 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
     }
   };
 
+  const handleQueue = async () => {
+    if (sel.length === 0) {
+      toast({ type: 'warning', message: 'Pilih minimal satu device.' });
+      return;
+    }
+
+    const invalidDevs = [];
+    const warnings = [];
+    const conditionsPayload = {};
+
+    sel.forEach((uuid) => {
+      const inst = instances.find((i) => i.uuid === uuid);
+      const name = inst ? inst.name : uuid.slice(0, 8);
+      const cfg = getStopConfig(uuid);
+
+      if (cfg.stop_mode === 'limit') {
+        const val = parseInt(cfg.stop_limit, 10);
+        if (isNaN(val) || val < 1) {
+          invalidDevs.push(`${name} (target harus berupa angka >= 1)`);
+        } else {
+          conditionsPayload[uuid] = { stop_mode: 'limit', stop_limit: val };
+        }
+      } else {
+        conditionsPayload[uuid] = { stop_mode: 'until_exhausted', stop_limit: 100 };
+      }
+
+      if (inst) {
+        const warn = getDeviceWarning(inst);
+        if (warn) {
+          warnings.push(`[${name}] ${warn}`);
+        }
+      }
+    });
+
+    if (invalidDevs.length > 0) {
+      toast({
+        type: 'error',
+        title: 'Validasi Stop Condition Gagal',
+        message: 'Perbaiki target angka pada device berikut sebelum mengantrekan:',
+        lines: invalidDevs,
+      });
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const res = await controlApi.bulkQueue(sel, mode, conditionsPayload);
+      report('QUEUE', res, warnings);
+    } catch (e) {
+      toast({ type: 'error', title: 'QUEUE', message: errorDetail(e, 'Gagal mengantrekan tugas') });
+    } finally {
+      setBusy(false);
+      if (onActionComplete) onActionComplete();
+    }
+  };
+
+  const handleCancelQueue = async (uuid) => {
+    try {
+      await instancesApi.cancelQueue(uuid);
+      toast({ type: 'success', message: 'Antrian berhasil dibatalkan.' });
+    } catch (e) {
+      toast({ type: 'error', message: errorDetail(e, 'Gagal membatalkan antrian') });
+    } finally {
+      if (onActionComplete) onActionComplete();
+    }
+  };
+
   const exec = async (title, fn) => {
     if (sel.length === 0) {
       toast({ type: 'warning', message: 'Pilih minimal satu device.' });
@@ -223,6 +296,11 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
   const selDevices = instances.filter((i) => selected.has(i.uuid));
   const switchableCount = selDevices.filter((i) => ACTIVE_RUN.has(i.status) && i.mode && i.mode !== mode).length;
   const sameModeCount = selDevices.filter((i) => ACTIVE_RUN.has(i.status) && i.mode === mode).length;
+  const queueableCount = selDevices.filter((i) => {
+    if (!ACTIVE_RUN.has(i.status)) return false;
+    const lastMode = (i.task_queue && i.task_queue.length > 0) ? i.task_queue[i.task_queue.length - 1].mode : i.mode;
+    return lastMode !== mode;
+  }).length;
   const btn = 'flex-1 px-3 py-2.5 rounded-xl font-semibold text-xs flex items-center justify-center gap-1.5 transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100';
 
   return (
@@ -436,6 +514,22 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
                           Auto-Resume: {MODE_SHORT[i.pending_task_mode] || i.pending_task_mode} ({i.pending_task_completed || 0}/{i.pending_task_stop_mode === 'until_exhausted' ? '∞' : (i.pending_task_stop_limit || 100)})
                         </span>
                       )}
+                      {i.has_queued_tasks && (
+                        <span className="inline-flex items-center gap-1 text-[9px] px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono shrink-0" title={`Antrian tugas: ${Array.isArray(i.task_queue) ? i.task_queue.map(q => q.mode).join(', ') : i.next_queued_mode}`}>
+                          <Clock className="w-2.5 h-2.5" /> Antrian: {MODE_SHORT[i.next_queued_mode] || i.next_queued_mode} {i.queue_length > 1 ? `(+${i.queue_length - 1})` : ''}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleCancelQueue(i.uuid);
+                            }}
+                            className="text-amber-400 hover:text-rose-400 ml-0.5 hover:bg-amber-900/40 rounded px-0.5 font-bold"
+                            title="Batalkan seluruh antrian device ini"
+                          >
+                            ×
+                          </button>
+                        </span>
+                      )}
                     </div>
                     <div className="text-[10px] text-slate-500 font-mono flex items-center gap-2 mt-0.5">
                       <span>{i.address}</span>
@@ -565,6 +659,19 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
           <span className="truncate">{switchableCount > 0 ? 'START / SWITCH MODE' : 'START'}</span>
         </button>
         <button
+          disabled={noSel || busy || queueableCount === 0}
+          onClick={handleQueue}
+          title={
+            queueableCount > 0
+              ? `Antrekan mode '${MODE_SHORT[mode]}' ke ${queueableCount} device yang sedang aktif (tugas saat ini diselesaikan terlebih dahulu)`
+              : 'Tombol QUEUE hanya aktif jika ada device terpilih yang sedang berjalan pada mode berbeda'
+          }
+          className={`${btn} bg-amber-600 hover:bg-amber-500 text-white shadow-lg shadow-amber-600/20`}
+        >
+          <ListPlus className="w-3.5 h-3.5 shrink-0" />
+          <span className="truncate">QUEUE {queueableCount > 0 ? `(${queueableCount})` : ''}</span>
+        </button>
+        <button
           disabled={noSel || busy}
           onClick={() => exec('STOP', () => controlApi.bulkStop(sel))}
           className={`${btn} bg-rose-600 hover:bg-rose-500 text-white shadow-lg shadow-rose-600/20`}
@@ -583,14 +690,19 @@ export default function CommandCenter({ instances, toast, onAdd, onActionComplet
         </button>
       </div>
       <p className="text-[10px] text-slate-500 leading-relaxed">
-        {switchableCount > 0 ? (
+        {queueableCount > 0 && switchableCount > 0 ? (
+          <span className="text-amber-300">
+            <strong>START / SWITCH:</strong> Eksekusi seketika (menghentikan tugas saat ini &amp; berpindah mode).{' '}
+            <strong>QUEUE:</strong> Mengantrekan mode baru (menunggu tugas saat ini selesai terlebih dahulu tanpa gangguan).
+          </span>
+        ) : switchableCount > 0 ? (
           <span className="text-amber-300">
             {switchableCount} device aktif pada mode lain akan otomatis me-restart aplikasi &amp; berpindah ke mode{' '}
             <strong>{MODE_SHORT[mode]}</strong>
             {sameModeCount > 0 ? ` (${sameModeCount} device bermode sama tetap jalan)` : ''}.
           </span>
         ) : (
-          'Setiap device menjalankan Stop Condition-nya masing-masing secara independen. Device dengan mode berbeda akan otomatis berpindah mode.'
+          'START menjalankan tugas seketika. QUEUE mengantrekan tugas mendatang untuk device yang sedang aktif. Setiap device memiliki antrian mandiri.'
         )}
       </p>
 

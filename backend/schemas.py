@@ -122,6 +122,25 @@ class TestAIRequest(BaseModel):
     ai_model: Optional[str] = None
 
 
+# ---- Queue ----
+class QueueAddRequest(BaseModel):
+    mode: str = Field(default="auto")
+    stop_mode: Optional[str] = Field(default="limit", description="'limit' or 'until_exhausted'")
+    stop_limit: Optional[int] = Field(default=100, ge=1)
+
+
+class BulkQueueRequest(BaseModel):
+    device_uuids: List[str] = Field(default_factory=list)
+    mode: str = Field(default="auto")
+    device_stop_conditions: Optional[Any] = Field(default=None, description="List or map of per-device stop conditions")
+    stop_mode: Optional[str] = Field(default="limit")
+    stop_limit: Optional[int] = Field(default=100, ge=1)
+
+
+class CancelQueueRequest(BaseModel):
+    queue_id: Optional[str] = None  # None = clear all queue items
+
+
 # ---- Redroid (Linux Docker) ----
 class RedroidInstallImageRequest(BaseModel):
     android_version: Optional[str] = Field(default="a11_magisk_ndk_amd", max_length=64)

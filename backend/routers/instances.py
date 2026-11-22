@@ -1,12 +1,14 @@
 import os
 import logging
-from fastapi import APIRouter, HTTPException, Response
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Response, Query
 
 from backend.config import settings, PROJECT_ROOT
 from backend.schemas import (
     ActionResponse, InstanceTestRequest, InstanceInstallAppRequest, InstancePairRequest,
     InstanceCreateRequest, InstanceUpdateRequest, InstanceStartRequest,
     LoginCredentialsRequest, LoginOtpRequest,
+    QueueAddRequest, CancelQueueRequest,
 )
 from backend.adb_manager import adb_manager, NUSUK_SPLIT_APKS
 from backend.instance_manager import instance_manager, LoginStatus
@@ -186,6 +188,46 @@ def stop_instance(device_uuid: str):
         raise HTTPException(status_code=404, detail="Instance tidak ditemukan")
     res = orchestrator.stop_many([device_uuid])
     return ActionResponse(success=True, message=res["message"])
+
+
+@router.post("/{device_uuid}/queue", response_model=ActionResponse)
+def add_instance_queue(device_uuid: str, payload: QueueAddRequest):
+    inst = instance_manager.get_instance(device_uuid)
+    if not inst:
+        raise HTTPException(status_code=404, detail="Instance tidak ditemukan")
+    try:
+        res = orchestrator.queue_many(
+            [device_uuid],
+            payload.mode,
+            device_stop_conditions={device_uuid: {"stop_mode": payload.stop_mode, "stop_limit": payload.stop_limit}},
+            stop_mode=payload.stop_mode or "limit",
+            stop_limit=payload.stop_limit or 100,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if res["queued"]:
+        return ActionResponse(success=True, message=res["message"], data=res)
+    reason = res["skipped"][0]["reason"] if res["skipped"] else "Gagal mengantrekan tugas"
+    raise HTTPException(status_code=400, detail=reason)
+
+
+@router.delete("/{device_uuid}/queue", response_model=ActionResponse)
+def cancel_instance_queue(device_uuid: str, queue_id: Optional[str] = Query(None)):
+    inst = instance_manager.get_instance(device_uuid)
+    if not inst:
+        raise HTTPException(status_code=404, detail="Instance tidak ditemukan")
+    res = orchestrator.cancel_queue(device_uuid, queue_id=queue_id)
+    if res["success"]:
+        return ActionResponse(success=True, message=res["message"])
+    raise HTTPException(status_code=400, detail=res["message"])
+
+
+@router.get("/{device_uuid}/queue")
+def get_instance_queue(device_uuid: str):
+    inst = instance_manager.get_instance(device_uuid)
+    if not inst:
+        raise HTTPException(status_code=404, detail="Instance tidak ditemukan")
+    return {"device_uuid": device_uuid, "items": instance_manager.get_queue(device_uuid)}
 
 
 @router.post("/{device_uuid}/force-restart-app", response_model=ActionResponse)

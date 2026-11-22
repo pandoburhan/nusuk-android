@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import settings
 from backend.database import get_db
-from backend.schemas import ActionResponse, BulkStartRequest, BulkStopRequest, BulkRestartRequest
+from backend.schemas import ActionResponse, BulkStartRequest, BulkStopRequest, BulkRestartRequest, BulkQueueRequest
 from backend.instance_manager import instance_manager
 from backend.orchestrator import orchestrator
 
@@ -60,6 +60,29 @@ def bulk_start(req: BulkStartRequest):
 @router.post("/bulk/stop")
 def bulk_stop(req: BulkStopRequest):
     return orchestrator.stop_many(req.device_uuids)
+
+
+@router.post("/bulk/queue")
+def bulk_queue(req: BulkQueueRequest):
+    try:
+        return orchestrator.queue_many(
+            device_uuids=req.device_uuids,
+            mode=req.mode,
+            device_stop_conditions=req.device_stop_conditions,
+            stop_mode=req.stop_mode or "limit",
+            stop_limit=req.stop_limit or 100,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/bulk/cancel-queue")
+def bulk_cancel_queue(req: BulkStopRequest):
+    results = []
+    for uid in dict.fromkeys(req.device_uuids):
+        res = orchestrator.cancel_queue(uid)
+        results.append({"device_uuid": uid, **res})
+    return {"success": True, "message": f"Antrian dibatalkan untuk {len(results)} device.", "data": results}
 
 
 @router.post("/bulk/force-restart")

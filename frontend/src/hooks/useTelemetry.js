@@ -64,6 +64,16 @@ export function useTelemetry(authToken, onUnauthorized) {
             break;
           }
 
+          case 'queue_update': {
+            patchInstance(data.device_uuid, {
+              task_queue: data.task_queue || [],
+              queue_length: data.queue_length || 0,
+              has_queued_tasks: Boolean(data.has_queued_tasks || (data.task_queue && data.task_queue.length > 0)),
+              next_queued_mode: data.next_queued_mode || (data.task_queue && data.task_queue[0] ? data.task_queue[0].mode : null),
+            });
+            break;
+          }
+
           case 'app_keys_update':
             patchInstance(data.device_uuid, { current_app_keys: data.current_app_keys });
             break;

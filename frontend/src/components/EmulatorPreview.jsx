@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Smartphone, Settings as Gear, Eye, EyeOff, RefreshCw, Power, Plug, Pencil, Trash2,
-  WifiOff, Loader2, RotateCcw, Plus, X, Maximize2, Gauge, LogIn, KeyRound,
+  WifiOff, Loader2, RotateCcw, Plus, X, Maximize2, Gauge, LogIn, KeyRound, Clock, ListFilter,
 } from 'lucide-react';
 import { instancesApi, errorDetail } from '../api/client';
 import { ONLINE, StatusBadge, ConnectionBadge, statusDot, fmtUptime, ConfirmModal } from './common';
@@ -284,6 +284,11 @@ function FullscreenPreviewModal({ inst, previewSpeed, onChangePreviewSpeed, inte
                   Auto-Resume: {MODE_SHORT[inst.pending_task_mode] || inst.pending_task_mode} ({inst.pending_task_completed || 0}/{inst.pending_task_stop_mode === 'until_exhausted' ? '∞' : (inst.pending_task_stop_limit || 100)})
                 </span>
               )}
+              {inst.has_queued_tasks && (
+                <span className="text-[10px] px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono flex items-center gap-1" title={`Antrian tugas: ${Array.isArray(inst.task_queue) ? inst.task_queue.map(q => q.mode).join(', ') : inst.next_queued_mode}`}>
+                  <Clock className="w-3 h-3" /> Next: {MODE_SHORT[inst.next_queued_mode] || inst.next_queued_mode} {inst.queue_length > 1 ? `(+${inst.queue_length - 1})` : ''}
+                </span>
+              )}
             </div>
             <div className="text-[11px] text-slate-400 font-mono truncate flex items-center gap-2 mt-0.5">
               <span>{inst.address}</span>
@@ -519,6 +524,11 @@ function DeviceCard({ inst, previewSpeed, intervalMs, patchInstance, toast, onEd
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <StatusBadge status={inst.status} />
+          {inst.has_queued_tasks && (
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono flex items-center gap-1 shrink-0" title={`Antrian: ${Array.isArray(inst.task_queue) ? inst.task_queue.map(q => q.mode).join(', ') : inst.next_queued_mode}`}>
+              <Clock className="w-2.5 h-2.5" /> Next: {MODE_SHORT[inst.next_queued_mode] || inst.next_queued_mode} {inst.queue_length > 1 ? `(+${inst.queue_length - 1})` : ''}
+            </span>
+          )}
 
           {/* Expand Fullscreen Button */}
           <button
@@ -572,6 +582,19 @@ function DeviceCard({ inst, previewSpeed, intervalMs, patchInstance, toast, onEd
                   >
                     <Plug className="w-3.5 h-3.5" /> Reconnect ADB
                   </button>
+                  {inst.has_queued_tasks && (
+                    <button
+                      className={`${itemCls} text-amber-300 hover:text-amber-200`}
+                      onClick={() =>
+                        run(async () => {
+                          await instancesApi.cancelQueue(inst.uuid);
+                          refreshInstances();
+                        }, `Seluruh antrian (${inst.queue_length}) dibatalkan`)
+                      }
+                    >
+                      <X className="w-3.5 h-3.5 text-amber-400" /> Batalkan Antrian ({inst.queue_length})
+                    </button>
+                  )}
                   <div className="my-1 border-t border-slate-800" />
                   <button
                     className={itemCls}
@@ -664,6 +687,11 @@ function DeviceCard({ inst, previewSpeed, intervalMs, patchInstance, toast, onEd
           {ONLINE.includes(inst.status) && (
             <span className="ml-1 text-emerald-400 font-mono font-medium">
               ({inst.session_completed_count ?? 0}/{inst.stop_mode === 'until_exhausted' ? '∞' : (inst.stop_limit || 100)})
+            </span>
+          )}
+          {inst.has_queued_tasks && (
+            <span className="ml-1 text-amber-300 font-mono font-medium" title={`Antrian: ${inst.next_queued_mode}`}>
+              [Q: {MODE_SHORT[inst.next_queued_mode] || inst.next_queued_mode}]
             </span>
           )}
           {!ONLINE.includes(inst.status) && inst.has_pending_task && (

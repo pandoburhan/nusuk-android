@@ -91,6 +91,8 @@ class Runtime:
         self.stop_limit: int = 100
         self.session_completed_count: int = 0
         self.task_intent: Optional[TaskIntent] = None
+        # Task queue — FIFO list of queued future tasks (persisted to BotSetting)
+        self.task_queue: List[Dict] = []
         # Auto-Login state & thread-safe operator handoff (in-memory only, never persisted)
         self.login_status: str = LoginStatus.LOGGED_IN
         self.login_error: Optional[str] = None
@@ -129,6 +131,8 @@ class InstanceManager:
         r = self.rt(device_uuid)
         uptime = int(time.time() - r.start_time) if r.start_time and r.status in ("RUNNING", "RECOVERING", "STOPPING") else 0
         ti = getattr(r, "task_intent", None)
+        tq = getattr(r, "task_queue", [])
+        next_q = tq[0] if tq else None
         return {
             "device_uuid": device_uuid, "status": r.status, "mode": r.mode,
             "current_screen": r.current_screen, "current_step": r.current_step,
@@ -143,6 +147,11 @@ class InstanceManager:
             "pending_task_stop_mode": ti.stop_mode if ti else None,
             "pending_task_stop_limit": ti.stop_limit if ti else None,
             "pending_task_completed": ti.completed_count if ti else 0,
+            # Queue fields
+            "task_queue": list(tq),
+            "queue_length": len(tq),
+            "has_queued_tasks": len(tq) > 0,
+            "next_queued_mode": next_q["mode"] if next_q else None,
         }
 
     def emit_status(self, device_uuid: str):
@@ -259,6 +268,118 @@ class InstanceManager:
             r.task_intent = None
         self._delete_task_intent(device_uuid)
         self.emit_status(device_uuid)
+
+    # ------------------------------------------------------------------ task queue (FIFO per-device)
+    def enqueue_task(
+        self,
+        device_uuid: str,
+        mode: str,
+        stop_mode: str = "limit",
+        stop_limit: int = 100,
+    ) -> Dict:
+        """Add one task to the FIFO queue for this device. Returns the queue item dict."""
+        import uuid as _uuid
+        item = {
+            "queue_id": str(_uuid.uuid4()),
+            "mode": mode,
+            "stop_mode": stop_mode or "limit",
+            "stop_limit": max(1, int(stop_limit or 100)),
+            "enqueued_at": utc_now_naive().isoformat(),
+        }
+        with self._lock:
+            r = self.rt(device_uuid)
+            r.task_queue.append(item)
+            queue_copy = list(r.task_queue)
+        self._persist_task_queue(device_uuid, queue_copy)
+        self.emit_status(device_uuid)
+        return item
+
+    def dequeue_next_task(self, device_uuid: str) -> Optional[Dict]:
+        """Pop and return the first item from the queue (FIFO). Returns None if empty."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            if not r.task_queue:
+                return None
+            item = r.task_queue.pop(0)
+            queue_copy = list(r.task_queue)
+        self._persist_task_queue(device_uuid, queue_copy)
+        self.emit_status(device_uuid)
+        return item
+
+    def get_queue(self, device_uuid: str) -> List[Dict]:
+        with self._lock:
+            return list(getattr(self.rt(device_uuid), "task_queue", []))
+
+    def cancel_queue_item(self, device_uuid: str, queue_id: str) -> bool:
+        """Remove a specific item by queue_id. Returns True if found and removed."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            original = list(r.task_queue)
+            r.task_queue = [item for item in r.task_queue if item.get("queue_id") != queue_id]
+            removed = len(r.task_queue) != len(original)
+            queue_copy = list(r.task_queue)
+        if removed:
+            self._persist_task_queue(device_uuid, queue_copy)
+            self.emit_status(device_uuid)
+        return removed
+
+    def clear_queue(self, device_uuid: str):
+        """Clear all queued tasks for this device."""
+        with self._lock:
+            r = self.rt(device_uuid)
+            r.task_queue = []
+        self._delete_task_queue(device_uuid)
+        self.emit_status(device_uuid)
+
+    def _persist_task_queue(self, device_uuid: str, queue: List[Dict]):
+        db = SessionLocal()
+        try:
+            k = f"task_queue:{device_uuid}"
+            val = json.dumps(queue, ensure_ascii=False)
+            setting = db.query(BotSetting).filter(BotSetting.setting_key == k).first()
+            if setting:
+                setting.setting_value = val
+                setting.updated_at = utc_now_naive()
+            else:
+                db.add(BotSetting(setting_key=k, setting_value=val, updated_at=utc_now_naive()))
+            db.commit()
+        except Exception as e:
+            logger.debug(f"Failed to persist task queue for {device_uuid}: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    def _delete_task_queue(self, device_uuid: str):
+        db = SessionLocal()
+        try:
+            k = f"task_queue:{device_uuid}"
+            db.query(BotSetting).filter(BotSetting.setting_key == k).delete()
+            db.commit()
+        except Exception as e:
+            logger.debug(f"Failed to delete task queue for {device_uuid}: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    def _load_all_task_queues(self):
+        db = SessionLocal()
+        try:
+            settings_rows = db.query(BotSetting).filter(BotSetting.setting_key.like("task_queue:%")).all()
+            for s in settings_rows:
+                dev_uuid = s.setting_key.split("task_queue:", 1)[1]
+                if s.setting_value:
+                    try:
+                        q = json.loads(s.setting_value)
+                        if isinstance(q, list):
+                            with self._lock:
+                                r = self.rt(dev_uuid)
+                                r.task_queue = q
+                    except Exception as err:
+                        logger.warning(f"Failed to parse task queue for {dev_uuid}: {err}")
+        except Exception as e:
+            logger.debug(f"Failed to load task queues: {e}")
+        finally:
+            db.close()
 
     def _persist_task_intent(self, device_uuid: str, intent: TaskIntent):
         db = SessionLocal()
@@ -393,6 +514,7 @@ class InstanceManager:
             with self._lock:
                 self.runtime[inst.uuid] = Runtime(last_app_keys=inst.last_app_keys)
         self._load_all_task_intents()
+        self._load_all_task_queues()
 
     def start_watchdog(self):
         if self._thread and self._thread.is_alive():
